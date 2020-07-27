@@ -180,7 +180,6 @@ red：不是所有索引的primary shard都是active状态的，部分索引有�
     # 删除索引
     DELETE /索引名称
 
-
 #### 向elasticsearch中添加和修改数据;
 
 语法, 使用POST或者PUT都可以，存在则更新否则创建；
@@ -244,7 +243,7 @@ red：不是所有索引的primary shard都是active状态的，部分索引有�
       "name":"华为P40 pro",
       "desc":"支持5G、超清摄像",
       "price":12000,
-      "producer":"Huawei",
+      "producer":"Huawei 成都",
       "tags":["mobile","huawei","5G"]
     }
     
@@ -272,13 +271,311 @@ red：不是所有索引的primary shard都是active状态的，部分索引有�
 
     # 删除
     DELETE /ecommerce/_doc/4
+
+### elasticsearch查询语句示例
+
+#### query string search
+
+`query string search`就是将查询条件放到http的参数上
+
+1、查询全部
+
+    GET /ecommerce/_search
+
+返回字段说明：
+
+    took：耗费了几毫秒
+    timed_out：是否超时
+    _shards：数据拆成几个分片，所以对于搜索请求，会打到所有的primary shard（或者是它的某个replica shard也可以）
+    hits.total：查询结果的数量，即几个document
+    hits.max_score：score的含义，就是document对于一个search的相关度的匹配分数，越相关，就越匹配，分数也高
+    hits.hits：包含了匹配搜索的document的详细数据
+
+2、查询名称包含`华为`的商品,并且按照售价降序排序
+
+    GET /ecommerce/_search?q=name:华为&sort=price:desc
+
+#### query DSL
+
+DSL：Domain Specified Language，特定领域的语言
+
+> http request body：请求体，可以用json的格式来构建查询语法，
+> 比较方便，可以构建各种复杂的语法，比query string search肯定强大多了
+
+查询所有match_all
+
+    GET /ecommerce/_search
+    {
+        "query": { "match_all": {} }
+    }
+
+查询名称包含`华为`的商品，同时按照价格降序排序
+
+    GET /ecommerce/_search
+    {
+      "query": {
+        "match": {
+          "name": "华为"
+        }
+      }
+      , "sort": [
+        {
+          "price": {
+            "order": "desc"
+          }
+        }
+      ]
+    }
     
+分页查询
 
+    GET /ecommerce/_search
+    {
+      "query": {
+        "match_all": {}
+      },
+      "from": 2,
+      "size": 2
+    }
+> from 从第几条开始，起始为0
+> size 返回多少条记录
+
+指定返回的字段
+
+    GET /ecommerce/_search
+    {
+      "query": {
+        "match_all": {}
+      },
+      "_source": ["name", "price"]
+    }
+#### query filter
+
+对数据进行过滤
+
+搜索商品名称包含`华为`，而且售价大于8000元的商品
+
+    GET /ecommerce/_search
+    {
+    "query": {
+     "bool": {
+       "must": [
+         {
+           "match": {
+             "name": "华为"
+           }
+         }
+       ],
+       "filter": [
+         {
+           "range": {
+             "price": {
+               "gt": 8000
+             }
+           }
+         }
+       ]
+     }
+    }
+    }
+    
+    或者
+    
+    GET /ecommerce/_search
+    {
+      "query": {
+        "bool": {
+          "must": {
+              "match": {
+                "name": "华为"
+              }
+            }
+          ,
+          "filter": {
+              "range": {
+                "price": {
+                  "gt": 8000
+                }
+              }
+            }
+        }
+      }
+    }
+    
+> bool 里面可以写多个条件
+
+#### full-text search（全文检索）
+
+全文检索会将输入的搜索串拆解开来，去倒排索引里面去一一匹配，只要能匹配上任意一个拆解后的单词，就可以作为结果返回
+    
+    GET /ecommerce/_search
+    {
+      "query":{
+        "match": {
+          "producer": "Huawei 成都"
+        }
+      }
+    }
+
+#### phrase search（短语搜索）
+
+跟全文检索相对应相反，phrase search，要求输入的搜索串，必须在指定的字段文本中，完全包含一模一样的，才可以算匹配，才能作为结果返回
+
+     GET /ecommerce/_search
+     {
+       "query": {
+         "match_phrase": {
+           "producer": "Huawei 成都"
+         }
+       }
+     }
  
+#### highlight search（高亮搜索结果）
 
-	
-	
+高亮搜索结果就是将匹配的字段做标识，就像百度搜索中那些匹配的内容是红色显示
 
+    GET /ecommerce/_search
+    {
+      "query": {
+        "match": {
+          "producer": "Huawei"
+        }
+      },
+     "highlight": {
+       "fields": {
+         "producer": {}
+       }
+     }
+    }
+
+#### 聚合：计算每个tag下的商品数量
+
+    GET /ecommerce/_search
+    {
+      "size": 0, 
+      "aggs": {
+       "group_by_tags":{
+         "terms": {
+           "field": "tags"
+         }
+       }
+      }
+    }
+> group_by_tags 是随意取的一个名字，待会的查询统计结果会放到这个字段中
+> 加size是不返回原始数据
+
+上面那样操作会报错，需要先执行下面的语句，更新tags字段的fielddata属性设置为true
+
+    PUT /ecommerce/_mapping
+    {
+      "properties":{
+        "tags":{
+          "type":"text",
+          "fielddata":true
+        }
+      }
+    }
+#### 聚合：对名称中包含yagao的商品，计算每个tag下的商品数量
+
+    GET /ecommerce/_search
+    {
+      "size": 0, 
+      "query": {
+        "match": {
+          "name": "华为"
+        }
+      },
+      "aggs": {
+        "all_tags": {
+          "terms": {
+            "field": "tags"
+          }
+        }
+      }
+    }
+
+> 先执行query条件查询，然后对结果做aggs聚合处理
+    
+#### 聚合：计算每个tag下的商品的平均价格（先分组再平均）
+
+    GET /ecommerce/_search
+    {
+      "size": 0, 
+      "aggs": {
+        "group_by_tags": {
+          "terms": {
+            "field": "tags"
+          },
+          "aggs": {
+            "avg_price": {
+              "avg": {
+                "field": "price"
+              }
+            }
+          }
+        }
+      }
+    }
+
+#### 计算每个tag下的商品的平均价格，并且按照平均价格降序排序
+	
+	GET /ecommerce/_search
+    {
+      "size": 0
+      , "aggs": {
+        "all_tags": {
+          "terms": {
+            "field": "tags", "order": {
+              "avg_price": "desc"
+            }
+          },
+          "aggs": {
+            "avg_price": {
+              "avg": {
+                "field": "price"
+              }
+            }
+          }
+        }
+      }
+    }
+
+#### 按照指定的价格范围区间进行分组，然后在每组内再按照tag进行分组，最后再计算每组的平均价格
+
+    GET /ecommerce/_search
+    {
+      "size": 0, 
+      "aggs": {
+        "group_by_price": {
+          "range": {
+            "field": "price",
+            "ranges": [
+              {
+                "from": 0,
+                "to": 5000
+              },
+              {
+                "from": 6000
+              }
+            ]
+          },
+          "aggs": {
+            "group_by_tags": {
+              "terms": {
+                "field": "tags"
+              },
+              "aggs": {
+                "avg_price": {
+                  "avg": {
+                    "field": "price"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
 
 
 
