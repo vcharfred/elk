@@ -15,11 +15,11 @@ Logstash是一个用来搜集、分析、过滤日志的工具。它支持几乎
 
 Kibana是一个基于Web的图形界面，用于搜索、分析和可视化存储在 Elasticsearch指标中的日志数据。它利用Elasticsearch的REST接口来检索数据，不仅允许用户创建他们自己的数据的定制仪表板视图，还允许他们以特殊的方式查询和过滤数据。
 
-## 一、Elasticsearch
+## 一、Elasticsearch基础
 
 现在主流的搜索引擎大概就是：Lucene，Solr，ElasticSearch。这里是对ElasticSearch的学习。
 
-### Elasticsearch的功能
+### 1.1 Elasticsearch的功能
     
 1. 分布式的搜索引擎和数据分析引擎
     
@@ -42,7 +42,7 @@ Kibana是一个基于Web的图形界面，用于搜索、分析和可视化存�
     
     跟分布式/海量数据相反的：lucene，单机应用，只能在单台服务器上使用，最多只能处理单台服务器可以处理的数据量
 
-### Elasticsearch的适用场景
+### 1.2 Elasticsearch的适用场景
 
 国外
 
@@ -66,14 +66,14 @@ Kibana是一个基于Web的图形界面，用于搜索、分析和可视化存�
 
     （9）国内：站内搜索（电商，招聘，门户，等等），IT系统搜索（OA，CRM，ERP，等等），数据分析（ES热门的一个使用场景）
 
-### elasticsearch的核心概念
+### 1.3 elasticsearch的核心概念
 
     Elasticsearch			数据库
     
     -----------------------------------------
     
     Document			行
-    Type				表
+    Type				表（在7.x以后已经移除了，默认为_doc; 在6.x以后一个索引只能有一个type了，在5.x以前一个索引可以有多个type）
     Index				库
 
  （1）Near Realtime（NRT）：近实时，两个意思，从写入数据到数据可以被搜索到有一个小延迟（大概1秒）；基于es执行搜索和分析可以达到秒级
@@ -86,13 +86,11 @@ Kibana是一个基于Web的图形界面，用于搜索、分析和可视化存�
 
  （5）Index：索引，包含一堆有相似结构的文档数据，比如可以有一个客户索引，商品分类索引，订单索引，索引有一个名称。一个index包含很多document，一个index就代表了一类类似的或者相同的document。比如说建立一个product index，商品索引，里面可能就存放了所有的商品数据，所有的商品document。
  
- （6）Type：类型，每个索引里都可以有一个或多个type，type是index中的一个逻辑数据分类，一个type下的document，都有相同的field，比如博客系统，有一个索引，可以定义用户数据type，博客数据type，评论数据type。
-
- （7）shard：单台机器无法存储大量数据，es可以将一个索引中的数据切分为多个shard，分布在多台服务器上存储。有了shard就可以横向扩展，存储更多数据，让搜索和分析等操作分布到多台服务器上去执行，提升吞吐量和性能。每个shard都是一个lucene index。
+ （6）shard：单台机器无法存储大量数据，es可以将一个索引中的数据切分为多个shard，分布在多台服务器上存储。有了shard就可以横向扩展，存储更多数据，让搜索和分析等操作分布到多台服务器上去执行，提升吞吐量和性能。每个shard都是一个lucene index。
  
- （8）replica：任何一个服务器随时可能故障或宕机，此时shard可能就会丢失，因此可以为每个shard创建多个replica副本。replica可以在shard故障时提供备用服务，保证数据不丢失，多个replica还可以提升搜索操作的吞吐量和性能。primary shard（建立索引时一次设置，不能修改，默认5个），replica shard（随时修改数量，默认1个），默认每个索引10个shard，5个primary shard，5个replica shard，最小的高可用配置，是2台服务器。
+ （7）replica：任何一个服务器随时可能故障或宕机，此时shard可能就会丢失，因此可以为每个shard创建多个replica副本。replica可以在shard故障时提供备用服务，保证数据不丢失，多个replica还可以提升搜索操作的吞吐量和性能。primary shard（建立索引时一次设置，不能修改，默认5个），replica shard（随时修改数量，默认1个），默认每个索引10个shard，5个primary shard，5个replica shard，最小的高可用配置，是2台服务器。
 
-### 使用docker安装Elasticsearch
+### 1.4 使用docker安装Elasticsearch
 
 1. 拉取docker镜像，由于国内网络原因，速度可能会比较慢或者无法下载；可以直接安装对应系统的安装包进行安装即可，基本都是解压运行即可。
 
@@ -144,10 +142,137 @@ Kibana是一个基于Web的图形界面，用于搜索、分析和可视化存�
       "tagline" : "You Know, for Search"
     }
 
-###  
+## 二、Kibana
+
+kibana的界面可以很方便的查看elasticsearch的信息，也可以做图表、指标等。同时提供控制台命令操作elasticsearch。
+
+### 使用docker安装kibana
+
+    # 拉取kibana的镜像
+    docker pull kibana:7.8.0
+    # 启动kibana
+    docker run -d --name kibana --link 已经启动的elasticsearch的容器ID或者是名字:elasticsearch -p 5601:5601 kibana:7.8.0  
+    # 例如
+    docker run -d --name kibana --link 074c8527cecd:elasticsearch -p 5601:5601 kibana:7.8.0
+
+通过`http://192.168.111.44:5601`访问kibana
+
+![](./image/kibana命令行.jpg)
+
+### 通过kibana的Console来做elasticsearch的crud和相关配置
+
+#### elasticsearch集群状态
+
+    GET _cat/health?v
+
+green：每个索引的primary shard和replica shard都是active状态的
+yellow：每个索引的primary shard都是active状态的，但是部分replica shard不是active状态，处于不可用的状态
+red：不是所有索引的primary shard都是active状态的，部分索引有数据丢失了
+
+> 后面加v是为了打印出更多的信息
+
+#### 索引相关操作
+
+    # 查询所有索引
+    GET _cat/indices?v
+    # 创建索引
+    PUT /索引名称?pretty
+    # 删除索引
+    DELETE /索引名称
+
+
+#### 向elasticsearch中添加和修改数据;
+
+语法, 使用POST或者PUT都可以，存在则更新否则创建；
+> 区别在于没有加ID值时（没有ID会自动生成），只能用POST表示创建；
+> 需要注意的是使用PUT做更新时，其实是直接覆盖，因此需要带上所有的数据；
+  
     
+    POST /索引名称/_doc
+    POST /索引名称/_create
+    
+    POST /索引名称/_doc/数据的id值
+    POST /索引名称/_create/数据的id值
+    
+    PUT /索引名称/_doc/数据的id值
+    PUT /索引名称/_create/数据的id值
 
+只更新指定字段的值：
 
+    POST/索引名称/_update/数据的ID值 {
+        "doc":{
+            // 更新内容
+        }
+    }
+
+#### 查询数据
+
+    # 查询所有
+    GET /索引名称/_search
+    # 根据ID查询
+    GET /索引名称/_doc/数据的id值
+
+#### 删除数据
+
+    DELETE /索引名称/_doc/数据的id值
+    
+#### 示例
+
+    # 添加或更新替换
+    POST /ecommerce/_doc/1
+    {
+      "name":"小米手机",
+      "desc":"支持5G、全面屏6.4",
+      "price":3000,
+      "producer":"小米",
+      "tags":["mobile","5G"]
+    }
+    
+    # 添加或更新替换
+    PUT /ecommerce/_doc/2
+    {
+      "name":"华为MacBook",
+      "desc":"支持5G、全面屏15.2寸",
+      "price":8000,
+      "producer":"Huawei",
+      "tags":["笔记本电脑","huawei"]
+    }
+    
+    # 添加或更新替换
+    POST /ecommerce/_create/3
+    {
+      "name":"华为P40 pro",
+      "desc":"支持5G、超清摄像",
+      "price":12000,
+      "producer":"Huawei",
+      "tags":["mobile","huawei","5G"]
+    }
+    
+    # 添加
+    POST /ecommerce/_doc
+    {
+      "name":"Ipad mini 5",
+      "desc":"7.9英寸",
+      "price":4000,
+      "producer":"apple",
+      "tags":["笔记本电脑","apple"]
+    }
+    
+    # 更新
+    POST /ecommerce/_update/1
+    {
+      "doc": {
+        "price":2000
+      }
+    }
+    
+    # 查询
+    GET /ecommerce/_search
+    GET /ecommerce/_doc/1
+
+    # 删除
+    DELETE /ecommerce/_doc/4
+    
 
  
 
