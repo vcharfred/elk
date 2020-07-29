@@ -904,6 +904,14 @@ bulk request会加载到内存里，如果太大的话，性能反而会下降�
 > 决定一个document在哪个shard上，最重要的一个值就是routing值，默认是_id，也可以手动指定，保证相同的routing值，每次过来，从hash函数中，产出的hash值一定是相同的；
 > 这也是为什么ES启动后设置好primary_shards数量之后，primary_shards的数量不能再更改了的原因
 
+### document增删改内部原理
+
+（1）客户端选择一个node发送请求过去，这个node就是coordinating node（协调节点）
+（2）coordinating node，对document进行路由，将请求转发给对应的node（有primary shard）
+（3）实际的node上的primary shard处理请求，然后将数据同步到replica node
+（4）coordinating node，如果发现primary node和所有replica node都搞定之后，就返回响应结果给客户端
+
+![](./image/Elasticsearch增删改内部原理.png)
 
 
 
