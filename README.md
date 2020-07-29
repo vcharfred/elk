@@ -679,6 +679,8 @@ es提供了一个feature，就是说，你可以不用它提供的内部_version
 4. 将修改后的新的document创建出来；
 
 > 实际上和传统的全量替换几乎一样。
+> 
+> 如果document不存在会报错
 
 #### 优点
 
@@ -694,6 +696,79 @@ es提供了一个feature，就是说，你可以不用它提供的内部_version
             "name" : "小米10"
       }
     }
+
+### es的脚本支持：groovy
+
+#### 使用内置脚本来做累加操作
+
+将price加1
+
+    POST /ecommerce/_update/1
+    {
+      "script": "ctx._source.price+=1"
+    }
+
+#### 外置脚本
+
+这个相当于关系型数据库的存储过程，将需要执行的脚本放到es的`config/scripts`目录下
+
+如在`config/scripts`目录下创建一个名为`add-price.groovy`文件，在里面写入如下脚本：
+
+    ctx._source.price+=add_price
+
+执行这个脚本：
+
+    POST /ecommerce/_update/1
+    {
+      "script": {
+        "lang": "groovy",
+        "file": "add-price",
+        "params": {
+          "add_price":1
+        }
+      }
+    }
+
+##### 示例删除document的脚本
+在`config/scripts`目录下创建一个名为`del-doc.groovy`文件，在里面写入如下脚本：
+
+    ctx.op = ctx._source.price>price?'delete':'none'
+
+执行脚本
+
+    POST /ecommerce/_update/1
+    {
+      "script": {
+        "lang": "groovy",
+        "file": "del-doc",
+        "params": {
+          "price":5000
+        }
+      }
+    }
+
+#### upsert的使用
+
+解决当在执行更新时document不存在导致更新失败的问题。
+
+    POST /ecommerce/_update/1
+    {
+      "script": "ctx._source.price+=1",
+      "upsert": {
+        "price":0,
+        "tags":[]
+      }
+    }
+
+> upsert就是没有的时候对document进行初始化
+
+
+
+
+
+
+
+
 
 
 
