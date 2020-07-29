@@ -697,7 +697,7 @@ es提供了一个feature，就是说，你可以不用它提供的内部_version
 
 #### 优点
 
-1. 所有查询、修改和写回操作都发生在es的一个shared内部，几乎避免了所有的网络数据传输开销，提升性能；
+1. 所有查询、修改和写回操作都发生在es的一个shard内部，几乎避免了所有的网络数据传输开销，提升性能；
 2. 减少了查询和修改的时间间隔，能够有效的减少并发的冲突的情况；（因为其内部操作几乎在毫秒级别）
 
 #### 示例
@@ -871,7 +871,38 @@ _bulk在执行的时候，如果其中有一条语句执行失败，不会影响
 #### bulk size最佳大小
 
 bulk request会加载到内存里，如果太大的话，性能反而会下降，因此需要反复尝试一个最佳的bulk size。
-一般从1000~5000条数据开始，尝试逐渐增加。另外，如果看大小的话，最好是在5~15MB之间。
+一般从1000到5000条数据开始，尝试逐渐增加。另外，如果看大小的话，最好是在5~15MB之间。
+
+### 什么是distributed document store？
+
+围绕着document在操作，其实就是把es当成了一个NoSQL存储引擎，一个可以存储文档类型数据的存储系统，操作里面的document。
+
+适合的的应用程序类型
+
+（1）数据量较大，es的分布式本质，可以帮助你快速进行扩容，承载大量数据
+
+（2）数据结构灵活多变，随时可能会变化，而且数据结构之间的关系，非常复杂，如果我们用传统数据库，那是不是很坑，因为要面临大量的表
+
+（3）对数据的相关操作，较为简单，比如就是一些简单的增删改查，用我们之前讲解的那些document操作就可以搞定
+
+（4）NoSQL数据库，适用的也是类似于上面的这种场景
+
+### document数据路由原理
+（1）document路由到shard上是什么意思？
+
+一个index的数据会被分为多片，每片都在一个shard中，因此一个document只能存在一个shard中；
+当有一个document需要操作时，es就需要知道这个document是放在index的那个shard上的。
+这个过程就称之为document的数据路由。
+
+（2）路由算法：shard = hash(routing) % number_of_primary_shards
+
+举个例子来简要说明哈这个算法：
+    一个index有3个primary shard（分别为P0，P1，P2），每次增删改查一个document的时候，都会带过来一个routing number，
+默认就是这个document的_id（可能是手动指定，也可能是自动生成）routing = _id，假设_id=1；将这个routing值传入一个hash函数中，产出一个routing值的hash值；
+然后将hash函数产出的值对这个index的primary shard的数量求余数，根据这个余数的值决定document放在那个shard上
+
+> 决定一个document在哪个shard上，最重要的一个值就是routing值，默认是_id，也可以手动指定，保证相同的routing值，每次过来，从hash函数中，产出的hash值一定是相同的；
+> 这也是为什么ES启动后设置好primary_shards数量之后，primary_shards的数量不能再更改了的原因
 
 
 
