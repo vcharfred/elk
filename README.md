@@ -214,6 +214,8 @@ red：不是所有索引的primary shard都是active状态的，部分索引有�
 #### 删除数据
 
     DELETE /索引名称/_doc/数据的id值
+
+> 删除使用的逻辑删除，之后会统一进行物理删除
     
 #### 示例
 
@@ -294,6 +296,10 @@ red：不是所有索引的primary shard都是active状态的，部分索引有�
 2、查询名称包含`华为`的商品,并且按照售价降序排序
 
     GET /ecommerce/_search?q=name:华为&sort=price:desc
+
+3、只返回name、price字段
+
+    GET /ecommerce/_search?_source=name,price
 
 #### query DSL
 
@@ -577,11 +583,11 @@ DSL：Domain Specified Language，特定领域的语言
       }
     }
 
-### Elasticsearch 的分布式集群图
+## 三、Elasticsearch 的分布式集群
 
 ![](./image/Elasticsearch集群分布式构架.png)
 
-#### shard&replica机制
+### shard&replica机制
 
  （1）index包含多个shard
  
@@ -599,7 +605,7 @@ DSL：Domain Specified Language，特定领域的语言
  
  （8）primary shard不能和自己的replica shard放在同一个节点上（否则节点宕机，primary shard和副本都丢失，起不到容错的作用），但是可以和其他primary shard的replica shard放在同一个节点上
 
-#### 单node环境下创建index
+### 单node环境下创建index
 
 （1）单node环境下，创建一个index，有3个primary shard，3个replica shard
 
@@ -608,6 +614,28 @@ DSL：Domain Specified Language，特定领域的语言
 （3）这个时候，只会将3个primary shard分配到仅有的一个node上去，另外3个replica shard是无法分配的
 
 （4）集群可以正常工作，但是一旦出现节点宕机，数据全部丢失，而且集群不可用，无法承接任何请求
+
+## 四、Elasticsearch内部相关实现
+
+### 并发数据修改控制
+ 
+Elasticsearch内部是多线程异步并发的进行修改（即可能出现后修改的先处理），采用version进行乐观锁；
+
+具体原理：Elasticsearch每次执行更新和删除操作成功时，它的version都会自动加1，
+每次执行更新删除时会带上版本号，如果版本如果版本号不一致，则会放弃此次操作；
+这样就保证了后修改的先执行的情况能够正常处理，不会被先修改的覆盖掉。
+
+#### 示例：在更新的时候带上版本号参数
+
+    POST /ecommerce/_update/2?version=3
+    {
+      "doc":{
+        "tags":["laptop ", "Huawei"]
+      }
+    }
+
+> 当版本号version不匹配的时候会更新失败
+
 
 
 
