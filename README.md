@@ -661,7 +661,7 @@ es提供了一个feature，就是说，你可以不用它提供的内部_version
 
 ### partial update说明
 
-语法：
+语法（url地址后面可以加版本号?version=1）：
 
     POST /索引名称/_update/ID值
     {
@@ -681,6 +681,19 @@ es提供了一个feature，就是说，你可以不用它提供的内部_version
 > 实际上和传统的全量替换几乎一样。
 > 
 > 如果document不存在会报错
+
+同时partial update将自动执行基于version的乐观锁并发控制
+
+
+设置在发送冲突时进行重试的次数
+
+    POST /ecommerce/_update/1?retry_on_conflict=2
+    {
+      "doc": {
+        "price":3000
+      }
+    }
+
 
 #### 优点
 
@@ -762,6 +775,71 @@ es提供了一个feature，就是说，你可以不用它提供的内部_version
 
 > upsert就是没有的时候对document进行初始化
 
+### mget批量查询
+
+普通的查询方式只能一条一条的查询，使用mget可以实现批量查询，减少网络开销
+
+#### 查询ID为1和2的数据
+
+不同的index
+
+    GET /_mget
+    {
+      "docs":[
+        {
+          "_index":"ecommerce",
+          "_id":1
+        },
+            {
+          "_index":"goods",
+          "_id":2
+        }
+        ]
+    }
+
+同一个index
+
+    GET /ecommerce/_mget
+    {
+      "docs":[
+        {
+          "_id":1
+        },
+        {
+          "_id":2
+        }
+        ]
+    }
+    
+同一个index且相同的filed      
+
+    GET /ecommerce/_mget
+    {
+      "ids":[1,2]
+      
+    }
+
+对返回的source字段进行过滤
+
+    GET /ecommerce/_mget
+    {
+      "docs":[
+        {
+          "_id":1,
+          "_source":["price","name"]
+        },
+        {
+          "_id":2,
+          "_source":"price"
+        },
+        {
+          "_id":3,
+          "_source":false
+        }
+        ]
+    }
+
+> 注意直接用ids来查询时不能进行字段过滤
 
 
 
