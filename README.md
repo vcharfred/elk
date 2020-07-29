@@ -775,7 +775,7 @@ es提供了一个feature，就是说，你可以不用它提供的内部_version
 
 > upsert就是没有的时候对document进行初始化
 
-### mget批量查询
+### _mget批量查询
 
 普通的查询方式只能一条一条的查询，使用mget可以实现批量查询，减少网络开销
 
@@ -841,7 +841,37 @@ es提供了一个feature，就是说，你可以不用它提供的内部_version
 
 > 注意直接用ids来查询时不能进行字段过滤
 
+### _bulk批量增删改
 
+create：创建
+delete：删除
+update：更新
+
+    POST /_bulk
+    {"delete":{"_index":"ecommerce","_id":3}}
+    {"create":{"_index":"ecommerce","_id":3}}
+    {"price":5000}
+    {"update":{"_index":"ecommerce","_id":3}}
+    {"doc":{"price":6000}}
+
+> 一条语句不能有换行这些，直接一行
+> 在create之后可以添加需要添加的属性
+> update的更新属性需要加`doc`
+> 如果在一个index中可以不写index，直接跟在url上即可
+
+    POST /ecommerce/_bulk
+    {"delete":{"_id":3}}
+    {"create":{"_id":3}}
+    {"price":5000}
+    {"update":{"_id":3}}
+    {"doc":{"price":6000}}
+
+_bulk在执行的时候，如果其中有一条语句执行失败，不会影响其他的执行，会在返回结果中将异常提示返回
+
+#### bulk size最佳大小
+
+bulk request会加载到内存里，如果太大的话，性能反而会下降，因此需要反复尝试一个最佳的bulk size。
+一般从1000~5000条数据开始，尝试逐渐增加。另外，如果看大小的话，最好是在5~15MB之间。
 
 
 
