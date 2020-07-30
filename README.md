@@ -1021,9 +1021,268 @@ bulk api奇特的json格式
 
     GET /_search?timeout=10m
 
+### 5.2 multi-index和multi-type搜索模式解析以及搜索原理
+
+#### multi-index和multi-type搜索模式
+
+如何一次性搜索多个index和多个type下的数据
+
+    GET /_search：               所有索引，所有type下的所有数据都搜索出来
+    GET /index1/_search：        指定一个index，搜索其下所有的数据
+    GET /index1,index2/_search： 同时搜索两个index下的数据
+    GET /*1,*2/_search：         按照通配符去匹配多个索引
+    GET /_all/_search            可以代表搜索所有index下的数据
+
+> 也可以加删除type属性，但是es
+
+#### 简单的搜索原理
+
+客户端发送一个请求，会将请求分发到所有的primary shard上执行，因为每一个shard上都包含部分数据，所有每一个shard上都可能包含搜索请求的结果；
+如果primary shard有 replica shard，那么请求也会发送到replica shard上去处理
+
+### 5.3 分页搜索以及deep paging性能问题
+
+#### 使用es进行分页搜索的语法
+
+size，from
+
+    GET /_search?size=10
+    GET /_search?size=10&from=0
+    GET /_search?size=10&from=20
+
+#### deep paging
+
+搜索很深就是deep paging；会很耗费性能，应当尽量避免。比如查询临近最后一页的数据，而数据在各个分片上，最后需要将各个分片返回的数据进行综合处理，每个分片实际返回数据不是每页的条数。
+
+### 5.4 快速掌握query string search语法以及_all metadata
+
+#### query string基础语法
+
+    GET /demo_index/_search?q=test_field:test
+    GET /demo_index/_search?q=+test_field:test
+    GET /demo_index/_search?q=-test_field:test
+
+使用+号和没有+号是一样，表示包含指定的关键词；-号表示不含
+
+#### _all metadata的原理和作用
+
+    # 匹配包含test的数据
+    GET /demo_index/_search?q=test
+
+直接可以搜索所有的field，任意一个field包含指定的关键字就可以搜索出来。我们在进行中搜索的时候，不是对document中的每一个field都进行一次搜索；
+    
+es中的_all元数据，在建立索引的时候，每插入一条document，它里面包含了多个field，此时，es会自动将多个field的值，全部用字符串的方式串联起来，变成一个长的字符串，作为_all field的值，同时建立索引；
+后面如果在搜索的时候，没有对某个field指定搜索，就默认搜索_all field，其中是包含了所有field的值的。
+    
+举个例子
+    
+    {
+      "name": "tom",
+      "age": 25,
+      "email": "tom@1qq.com",
+      "address": "beijing"
+    }
+    
+`tom 25 tom@qq.com beijing`，作为这一条document的_all field的值，同时进行分词后建立对应的倒排索引；生产环境通常不使用
+
+### 5.5 mapping到底是什么？
+
+自动或手动为index中的type建立的一种数据结构和相关配置，简称为mapping。
+
+当添加数据时会dynamic mapping，自动为我们建立index，创建type，以及type对应的mapping，mapping中包含了每个field对应的数据类型，以及如何分词等设置。
+
+#### 示例
+
+添加一些测试数据
+
+    PUT /website/_doc/1
+    {
+      "post_date": "2020-01-01",
+      "title": "my first article",
+      "content": "this is my first article in this website",
+      "author_id": 9527
+    }
+    
+    PUT /website/_doc/2
+    {
+      "post_date": "2020-01-02",
+      "title": "my second article",
+      "content": "this is my second article in this website",
+      "author_id": 9527
+    }
+    
+    PUT /website/_doc/3
+    {
+      "post_date": "2020-01-03",
+      "title": "my third article",
+      "content": "this is my third article in this website",
+      "author_id": 9527
+    }
+
+尝试如下搜索，只会返回1条数据：
+
+    GET /website/_search?q=2020
+    GET /website/_search?q=2020-01-02
+    GET /website/_search?q=post_date:2020-01-01
+    GET /website/_search?q=post_date:2020
+
+查看mapping
+
+    GET /website/_mapping
+
+搜索结果为什么不一致，因为es自动建立mapping的时候，设置了不同的field不同的data type。不同的data type的分词、搜索等行为是不一样的。所以出现了_all field和post_date field的搜索表现不是我们所期望的
+
+### 5.6 精确匹配与全文搜索的对比分析
+
+#### 精确匹配（exact value）
+
+2020-01-01，exact value，搜索的时候，2020-01-01，才能搜索出来；如果你输入一个01，是搜索不出来的
+
+#### 全文搜索（full text）
+
+* 缩写 vs. 全程：cn vs. china；如2020-01-01，2020 01 01，搜索2020，或者01，都可以搜索出来；china，搜索cn，也可以将china搜索出来
+* 格式转化：like liked likes；likes，搜索like，也可以将likes搜索出来
+* 大小写：Tom vs tom；Tom，搜索tom，也可以将Tom搜索出来
+* 同义词：like vs love；like，搜索love，同义词，也可以将like搜索出来
+
+所有全文搜索不只是匹配完整的一个值，而是可以对值进行拆分词语后（分词）进行匹配，也可以通过缩写、时态、大小写、同义词等进行匹配。
+
+### 5.7 倒排索引核心原理
+
+doc1：I really liked my small dogs, and I think my mom also liked them.
+doc2：He never liked any dogs, so I hope that my mom will not expect me to liked him.
+
+分词，初步的倒排索引的建立
+
+    |word  |doc1|doc2|
+    |:     |:   |:   |
+    |I     | *	|  * |
+    |really| *  |    |
+    |liked | *	|    |
+    |my	   | *	|  * |
+    |small | *	|    |
+    |dogs  | *  |    |
+    |and   | *  |    |
+    ....
+
+搜索`mother like little dog`，不可能有任何结果
+
+这个是不是我们想要的搜索结果，因为在我们看来，mother和mom有区别吗？同义词，都是妈妈的意思。like和liked有区别吗？没有，都是喜欢的意思，只不过一个是现在时，一个是过去时。little和small有区别吗？同义词，都是小小的。dog和dogs有区别吗？狗，只不过一个是单数，一个是复数。
+
+因此正常情况下在建立倒排索引的时候，会执行一个normalization操作，对拆分出的各个单词进行相应的处理，以提升后面搜索的时候能够搜索到相关联的文档的概率
+
+重新建立倒排索引，加入normalization，再次用mother liked little dog搜索，就可以搜索到了
+
+`mother like little dog`会先分词再normalization（时态的转换，单复数的转换，同义词的转换，大小写的转换）
+
+    mother	--> mom
+    like	--> like
+    little	--> little
+    dog	--> dog
+
+doc1和doc2都会搜索出来
+
+### 5.8 分词器的内部组成到底是什么，以及内置分词器的介绍
+
+#### 什么是分词器
+
+一个分词器，将一段文本拆分成一个一个的单个的单词，同时对每个单词进行normalization（时态转换，单复数转换），最后将处理好的结果才会拿去建立倒排索引。
+
+切分词语，normalization（提升召回率【recall】）；具体包含如下：
+
+    recall，召回率：搜索的时候，增加能够搜索到的结果的数量
+
+    character filter：在一段文本进行分词之前，先进行预处理，比如说最常见的就是，过滤html标签（<span>hello<span> --> hello），& --> and（I&you --> I and you）
+
+    tokenizer：分词，hello you and me --> hello, you, and, me
+
+    token filter：lowercase，stop word，synonymom，dogs --> dog，liked --> like，Tom --> tom，a/the/an --> 干掉，mother --> mom，small --> little
+
+### 5.9 query string的分词以及mapping
+
+query string必须以和index建立时相同的analyzer进行分词
+
+query string对exact value和full text的区别对待
+
+> 不同类型的field，可能有的就是full text，有的就是exact value；因此上面进行搜索时查询结果不是我们预期的
+
+#### 测试分词器
+
+    GET /_analyze
+    {
+      "analyzer": "standard",
+      "text": "Text to analyze"
+    }
+
+### 5.10 什么是mapping再次回炉透彻理解
+
+* 往es里面直接插入数据，es会自动建立索引，同时建立type以及对应的mapping
+* mapping中就自动定义了每个field的数据类型
+* 不同的数据类型（比如说text和date），可能有的是exact value，有的是full text
+* exact value，在建立倒排索引的时候，分词的时候，是将整个值一起作为一个关键词建立到倒排索引中的；full text，会经历各种各样的处理，分词，normaliztion（时态转换，同义词转换，大小写转换），才会建立到倒排索引中
+* 同时呢，exact value和full text类型的field就决定了，在一个搜索过来的时候，对exact value field或者是full text field进行搜索的行为也是不一样的，会跟建立倒排索引的行为保持一致；比如说exact value搜索的时候，就是直接按照整个值进行匹配，full text query string，也会进行分词和normalization再去倒排索引中去搜索
+* 可以用es的dynamic mapping，让其自动建立mapping，包括自动设置数据类型；也可以提前手动创建index和type的mapping，自己对各个field进行设置，包括数据类型，包括索引行为，包括分词器，等等
+
+mapping，就是index的type的元数据，每个type都有一个自己的mapping，决定了数据类型，建立倒排索引的行为，还有进行搜索的行为
+
+### 5.11 mapping的核心数据类型以及dynamic mapping    
+
+#### 核心的数据类型
+
+    string
+    byte，short，integer，long
+    float，double
+    boolean
+    date
+#### dynamic mapping类型推测
+
+    true or false	 -->	boolean
+    123		         -->	long
+    123.01		     -->	double
+    2020-01-01	     -->	date
+    "hello world es" -->	string/text
+
+### 5.12 手动建立和修改mapping以及定制string类型数据是否分词
+
+#### 如何建立索引
+
+    analyzed      ------ 分词类型
+    not_analyzed  ------ 不分词
+    no            ------ 不分词同时不能被搜索
+
+只能创建index时手动建立mapping，或者新增field mapping，但是不能update field mapping
+
+    PUT /website
+    {
+      "mappings": {
+        "properties": {
+          "author_id": {
+            "type": "long"
+          },
+          "title": {
+            "type": "text",
+            "analyzer": "english"
+          },
+          "content": {
+            "type": "text"
+          },
+          "post_date": {
+            "type": "date"
+          },
+          "publisher_id": {
+            "type": "keyword"
+          },
+          "is_del": {
+            "type":"boolean",
+            "index":false
+          }
+        }
+      }
+    }
+
+> "index":false 表示不加入索引
+> "type": "keyword" 表示不分词，在7.x版本后not_analyzed已经被取消掉了
 
 
 
-
-
-
+    
