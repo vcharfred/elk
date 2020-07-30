@@ -1003,6 +1003,25 @@ bulk api奇特的json格式
 
 5、最大的优势在于，不需要将json数组解析为一个JSONArray对象形成一份大数据的拷贝，浪费内存空间，这样可以尽可能地保证性能
 
+## 五、搜索引擎
+
+### 5.1 search结果解析（search timeout机制说明）
+
+![](./image/Elasticsearch搜索的timeout机制.png)
+
+    took：整个搜索请求花费了多少毫秒
+    hits.total：本次搜索，返回了几条结果
+    hits.max_score：本次搜索的所有结果中，最大的相关度分数是多少，每一条document对于search的相关度，_score分数越大，排位越靠前
+    hits.hits：默认查询前10条数据，完整数据，_score降序排序
+    timeout：默认无timeout，latency平衡completeness，手动指定timeout，timeout查询执行机制
+    shards：shards fail的条件（primary和replica全部挂掉），不影响其他shard。默认情况下来说，一个搜索请求，会打到一个index的所有primary shard上去，每个primary shard都可能会有一个或多个replica shard，所以请求也可以到primary shard的其中一个replica shard上去。
+
+
+带上超时参数：timeout=10ms，timeout=1s，timeout=1m
+
+    GET /_search?timeout=10m
+
+
 
 
 
