@@ -1798,6 +1798,8 @@ doc values是被保存在磁盘上的，此时如果内存足够，os会自动�
 2. coordinate node将请求转发到所有shard，每个shard本地搜索，并构建一个本地的priority queue
 3. 各个shard将自己的priority queue返回给coordinate node，并构建一个全局的priority queue
 
+![](./image/Elasticsearch的query_phase原理.png)
+
 #### replica shard如何提升搜索吞吐量
 
 一次请求要打到所有shard的一个replica/primary上去，如果每个shard都有多个replica，那么同时并发过来的搜索请求可以同时打到其他的replica上去
@@ -1811,6 +1813,8 @@ fetch phbase工作流程
 3. coordinate node将合并后的document结果返回给client客户端
 
 一般搜索，如果不加from和size，就默认搜索前10条，按照_score排序
+
+![](./image/Elasticsearch的fetch_phase原理.png)
 
 ### 5.25 搜索相关参数梳理以及bouncing results问题解决方案       
 
