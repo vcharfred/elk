@@ -1283,6 +1283,338 @@ mapping，就是index的type的元数据，每个type都有一个自己的mappin
 > "index":false 表示不加入索引
 > "type": "keyword" 表示不分词，在7.x版本后not_analyzed已经被取消掉了
 
+新增filed mapping
 
+    PUT /website/_mapping
+    {
+      "properties":{
+        
+        "new_filed":{
+          "type":"text",
+          "index":false
+        }
+      }
+    }
 
+### 5.13 mapping复杂数据类型以及object类型数据底层结构
+
+#### multivalue field
+
+    { "tags": [ "tag1", "tag2" ]}
+
+建立索引时与string是一样的，数据类型不能混
+
+#### empty field
+
+    null，[]，[null]
+
+#### object field
+
+    PUT /company/employee/1
+    {
+      "address": {
+        "country": "china",
+        "province": "guangdong",
+        "city": "guangzhou"
+      },
+      "name": "jack",
+      "age": 27,
+      "join_date": "2020-01-01"
+    }
+
+对应这种object类型的底层数据存储示例
+
+    "authors": [
+        { "age": 26, "name": "Jack White"},
+        { "age": 55, "name": "Tom Jones"},
+        { "age": 39, "name": "Kitty Smith"}
+    ]
     
+    上面的会转换成下面这种：
+    
+    {
+        "authors.age":    [26, 55, 39],
+        "authors.name":   [jack, white, tom, jones, kitty, smith]
+    }
+
+### 5.14 search api的基础语法介绍
+    
+#### search api的基本语法
+
+    GET /search
+    {}
+
+    GET /index1,index2/type1,type2/search
+    {}
+
+    GET /_search
+    {
+      "from": 0,
+      "size": 10
+    }
+
+#### http协议中get是否可以带上request body
+    
+HTTP协议，一般不允许get请求带上request body，但是因为get更加适合描述查询数据的操作。
+
+碰巧，很多浏览器，或者是服务器，也都支持GET+request body模式；如果遇到不支持的场景，也可以用POST /_search
+
+### 5.15 快速上机动手实战Query DSL搜索语法
+
+#### 示例什么是Query DSL
+
+    GET /_search
+    {
+        "query": {
+            "match_all": {}
+        }
+    }
+#### Query DSL的基本语法
+    {
+        QUERY_NAME: {
+            ARGUMENT: VALUE,
+            ARGUMENT: VALUE,...
+        }
+    }
+
+    {
+        QUERY_NAME: {
+            FIELD_NAME: {
+                ARGUMENT: VALUE,
+                ARGUMENT: VALUE,...
+            }
+        }
+    }
+
+示例
+
+    GET /test_index/_search 
+    {
+      "query": {
+        "match": {
+          "test_field": "test"
+        }
+      }
+    }
+    
+#### 如何组合多个搜索条件
+
+初始数据：
+
+    PUT /website/_doc/1
+    {
+      
+      "title": "my elasticsearch article",
+      "content": "es is very bad",
+      "author_id": 110
+    }
+    
+    PUT /website/_doc/2
+    {
+      
+      "title": "my elasticsearch article",
+      "content": "es is very good",
+      "author_id": 111
+    }
+    
+    PUT /website/_doc/3
+    {
+      
+      "title": "my elasticsearch article",
+      "content": "es is just so so",
+      "author_id": 112
+    }
+
+
+
+1. title必须包含elasticsearch，content可以包含elasticsearch也可以不包含，author_id必须不为111
+
+
+    GET /website/_search
+    {
+      "query": {
+        "bool": {
+          "must": [
+            {
+              "match": {
+                "title": "elasticsearch"
+              }
+            }
+          ],
+          "should": [
+            {
+              "match": {
+                "content": "elasticsearch"
+              }
+            }
+          ],
+          "must_not": [
+            {
+              "match": {
+                "author_id": 111
+              }
+            }
+          ]
+        }
+      }
+    }    
+
+示例2
+
+    GET /website/_search
+    {
+      "query": {
+        "bool": {
+          "must": {
+            "match": {
+              "name": "tom"
+            }
+          },
+          "should": [
+            {
+              "match": {
+                "hired": true
+              }
+            },
+            {
+              "bool": {
+                "must": {
+                  "match": {
+                    "personality": "good"
+                  }
+                },
+                "must_not": {
+                  "match": {
+                    "rude": true
+                  }
+                }
+              }
+            }
+          ],
+          "minimum_should_match": 1
+        }
+      }
+    }
+    
+> should 相当于or
+> bool 相当于（）
+> must 相当于and
+> must_not 就是不等于  
+
+### 5.16 filter与query深入对比解密：相关度，性能
+
+#### filter与query示例
+
+    PUT /company/_doc/1
+    {
+      "join_date": "2016-01-01",
+      "age":33,
+      "name":"tom cat"
+    }
+    
+    PUT /company/_doc/2
+    {
+      "join_date": "2016-01-01",
+      "age":29,
+      "name":"jerry mouse"
+    }
+
+搜索请求：年龄必须大于等于30，同时join_date必须是2016-01-01
+
+    GET /company/_search
+    {
+      "query": {
+        "bool": {
+          "must": [
+            {
+              "match": {
+                "join_date": "2016-01-01"
+              }
+            }
+          ],
+          "filter": {
+            "range": {
+              "age": {
+                "gte": 30
+              }
+            }
+          }
+        }
+      }
+    }
+
+#### filter与query对比大解密
+
+* filter，仅仅只是按照搜索条件过滤出需要的数据而已，不计算任何相关度分数，对相关度没有任何影响
+* query，会去计算每个document相对于搜索条件的相关度，并按照相关度进行排序
+
+一般来说，如果你是在进行搜索，需要将最匹配搜索条件的数据先返回，那么用query；如果只是要根据一些条件筛选出一部分数据，不关注其排序，那么用filter
+除非是你的这些搜索条件，你希望越符合这些搜索条件的document越排在前面返回，那么这些搜索条件要放在query中；如果你不希望一些搜索条件来影响你的document排序，那么就放在filter中即可
+
+#### filter与query性能
+
+* filter，不需要计算相关度分数，不需要按照相关度分数进行排序，同时还有内置的自动cache最常使用filter的数据
+* query，相反，要计算相关度分数，按照分数进行排序，而且无法cache结果
+
+### 5.17 常用的各种query搜索语法
+
+#### match all
+
+    GET /_search
+    {
+        "query": {
+            "match_all": {}
+        }
+    }
+
+#### match
+
+    GET /_search
+    {
+        "query": { "match": { "title": "my elasticsearch article" }}
+    }
+
+#### multi match
+
+    GET /test_index/_search
+    {
+      "query": {
+        "multi_match": {
+          "query": "test",
+          "fields": ["test_field", "test_field1"]
+        }
+      }
+    }
+
+#### range query
+
+    GET /company/_search 
+    {
+      "query": {
+        "range": {
+          "age": {
+            "gte": 30
+          }
+        }
+      }
+    }
+
+#### term query
+
+    GET /test_index/_search 
+    {
+      "query": {
+        "term": {
+          "test_field": "test hello"
+        }
+      }
+    }
+
+#### terms query
+
+对tag指定多个分组词
+
+    GET /_search
+    {
+        "query": { "terms": { "tag": [ "search", "full_text", "nosql" ] }}
+    }
