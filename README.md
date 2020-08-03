@@ -355,6 +355,7 @@ DSL：Domain Specified Language，特定领域的语言
       },
       "_source": ["name", "price"]
     }
+    
 #### query filter
 
 对数据进行过滤
@@ -436,6 +437,7 @@ DSL：Domain Specified Language，特定领域的语言
        }
      }
  
+ 
 #### highlight search（高亮搜索结果）
 
 高亮搜索结果就是将匹配的字段做标识，就像百度搜索中那些匹配的内容是红色显示
@@ -481,6 +483,7 @@ DSL：Domain Specified Language，特定领域的语言
         }
       }
     }
+    
 #### 聚合：对名称中包含yagao的商品，计算每个tag下的商品数量
 
     GET /ecommerce/_search
@@ -501,6 +504,7 @@ DSL：Domain Specified Language，特定领域的语言
     }
 
 > 先执行query条件查询，然后对结果做aggs聚合处理
+    
     
 #### 聚合：计算每个tag下的商品的平均价格（先分组再平均）
 
@@ -1873,3 +1877,477 @@ scoll搜索会在第一次搜索的时候，保存一个当时的视图快照，
         "scroll": "1m", 
         "scroll_id" : "FGluY2x1ZGVfY29udGV4dF91dWlkDXF1ZXJ5QW5kRmV0Y2gBFHg3bnJvM01CYXBadGRjZ1FELWNqAAAAAAAADY8WdXVKQzR3TzVSMEtialVYM1gxbWkzZw=="
     }
+
+## 六、索引管理
+
+### 6.1 索引的创建、修改、删除
+
+#### 创建索引
+
+指定分片信息、mapping信息
+
+    PUT /index_demo
+    {
+      "settings": {
+        "number_of_shards": 1,
+        "number_of_replicas": 0
+      },
+      "mappings": {
+        "properties": {
+          "name":{
+            "type": "text"
+          }
+        }
+      }
+    }
+
+使用默认的配置
+    
+    PUT /index_pretty?pretty
+
+#### 修改索引
+
+    PUT /index_demo/_settings
+    {
+      "number_of_replicas": 1
+    }
+
+#### 删除索引
+
+    DELETE /index_demo
+    DELETE /index_1,index_2
+    DELETE /index_demo*
+    DELETE /_all
+     
+     
+     
+### 6.2 修改分词器以及定制自己的分词器
+
+#### 默认的分词器standard
+
+* standard tokenizer：以单词边界进行切分
+* standard token filter：什么都不做
+* lowercase token filter：将所有字母转换为小写
+* stop token filer（默认被禁用）：移除停用词，比如a the it等等
+
+#### 修改分词器的设置
+
+* 启用english停用词token filter（创建索引的时候才可以）
+
+
+    PUT /index_demo
+    {
+      "settings": {
+        "number_of_shards": 1,
+        "number_of_replicas": 0,
+        "analysis": {
+          "analyzer": {
+            "es_std":{
+              "type": "standard",
+              "stopwords": "_english_"
+            }
+          }
+        }
+      },
+      "mappings": {
+        "properties": {
+          "name":{
+            "type": "text"
+          }
+        }
+      }
+    }
+
+测试定制的分词器的效果：
+
+    # 使用定制的
+    GET /index_demo/_analyze
+    {
+      "analyzer": "es_std",
+      "text": "a dog is in the house"
+    }
+    
+    # 使用默认的
+    GET /index_demo/_analyze
+    {
+      "analyzer": "standard",
+      "text":"a dog is in the house"
+    }
+
+#### 定制分词器
+
+将`&`转换为and，`a 、the`不做处理，将html标签过滤掉，将字符转为小写的
+
+    PUT /index_demo
+    {
+      "settings": {
+        "analysis": {
+          "char_filter": {
+            "&_to_and": {
+              "type": "mapping",
+              "mappings": ["&=> and"]
+            }
+          },
+          "filter": {
+            "my_stopwords":{
+              "type": "stop",
+              "stopwords": ["the", "a"]
+            }
+          },
+          "analyzer": {
+            "my_analyzer":{
+              "type":"custom",
+              "char_filter": ["html_strip", "&_to_and"],
+              "tokenizer":"standard",
+              "filter":["lowercase","my_stopwords"]
+            }
+          }
+        }
+      }
+    }    
+
+测试定制的分词器
+
+    GET /index_demo/_analyze
+    {
+      "text": "tom&jerry are a friend in the house, <a>, HAHA!!",
+      "analyzer": "my_analyzer"
+    }
+    
+    
+    
+### 6.3 深入探秘type底层数据结构
+
+type，是一个index中用来区分类似的数据的，类似的数据，但是可能有不同的fields，而且有不同的属性来控制索引建立、分词器；
+field的value，在底层的lucene中建立索引的时候，全部是opaque bytes类型，不区分类型的；
+lucene是没有type的概念的，在document中，实际上将type作为一个document的field来存储，即_type，es通过_type来进行type的过滤和筛选；
+一个index中的多个type，实际上是放在一起存储的，因此一个index下，不能有多个type重名，因为那样是无法处理的；
+在es7中一个index只能有一个type，默认为_doc，不推荐去自定义了。
+
+#### 举例说明
+
+设置的mappings如下：
+
+    {
+       "ecommerce": {
+          "mappings": {
+            "_type": {
+              "type": "string",
+              "index": "not_analyzed"
+            },
+            "name": {
+              "type": "string"
+            }
+            "price": {
+              "type": "double"
+            }
+            "service_period": {
+              "type": "string"
+            }
+            "eat_period": {
+              "type": "string"
+            }
+          }
+       }
+    }
+
+假设有如下2条数据存入
+
+    {
+      "name": "geli kongtiao",
+      "price": 1999.0,
+      "service_period": "one year"
+    }
+
+    {
+      "name": "aozhou dalongxia",
+      "price": 199.0,
+      "eat_period": "one week"
+    }
+
+在底层的存储是这样子的
+
+    {
+      "_type": "elactronic_goods",
+      "name": "geli kongtiao",
+      "price": 1999.0,
+      "service_period": "one year",
+      "eat_period": ""
+    }
+
+    {
+      "_type": "fresh_goods",
+      "name": "aozhou dalongxia",
+      "price": 199.0,
+      "service_period": "",
+      "eat_period": "one week"
+    }
+
+如果存入数据没有某个filed时，将会存入一个空值；假如说，将两个type的field完全不同，放在一个index下，那么就每条数据都至少有一半的field在底层的lucene中是空值，会有严重的性能问题；
+因此在es7中一个index只能有一个type，默认为_doc，不推荐去自定义了。
+    
+
+### 6.4 mapping root object剖析 
+
+#### root object
+
+就是某个type对应的mapping json，包括了properties，metadata（_id，_source，_type），settings（analyzer），其他settings（比如include_in_all）
+
+    PUT /index_demo
+    {
+      "mappings": {
+        "properties": {
+          
+        }
+      }
+    }
+
+#### properties
+
+type，index，analyzer
+
+    PUT /index_demo/_mapping
+    {
+      "properties": {
+        "title": {
+          "type": "text"
+        }
+      }
+    }
+
+#### _source
+
+优点：
+
+1. 查询的时候，直接可以拿到完整的document，不需要先拿document id，再发送一次请求拿document
+2. partial update基于_source实现
+3. reindex时，直接基于_source实现，不需要从数据库（或者其他外部存储）查询数据再修改
+4. 可以基于_source定制返回field
+5. debug query更容易，因为可以直接看到_source
+
+如果不需要上述好处，可以禁用_source；但是不建议这么做[官方说明](https://www.elastic.co/guide/en/elasticsearch/reference/current/mapping-source-field.html#disable-source-field)
+
+    PUT /index_demo
+    {
+      "mappings": {
+        "_source": {"enabled": false}
+      }
+    }
+
+#### 标识性metadata
+
+_index，_type，_id
+
+### 6.5 定制化自己的dynamic mapping
+
+#### 定制dynamic策略
+
+    true：遇到陌生字段，就进行dynamic mapping
+    false：遇到陌生字段，就忽略
+    strict：遇到陌生字段，就报错
+
+示例：
+
+    PUT /index_demo
+    {
+      "mappings": {
+        "dynamic":"strict",
+        "properties": {
+          "title":{
+            "type": "text"
+          },
+          "address":{
+            "type": "object",
+            "dynamic": true
+          }
+        }
+      }
+    }
+
+测试数据添加是否可以成功    
+    
+    PUT /index_demo/_doc/1
+    {
+      "title":"this is firestone",
+      "content":"this is content",
+      "address":{
+        "province":"北京",
+        "city":"北京"
+      }
+    }
+
+由于做了现在，因此上面这个会添加失败
+    
+    PUT /index_demo/_doc/1
+    {
+      "title":"this is firestone",
+      "address":{
+        "province":"北京",
+        "city":"北京"
+      }
+    }
+
+
+   
+   
+#### 定制dynamic mapping策略
+
+默认会按照一定格式识别date，比如yyyy-MM-dd。但是如果某个field先过来一个2017-01-01的值，就会被自动dynamic mapping成date，
+后面如果再来一个"hello world"之类的值，就会报错。可以手动关闭某个type的date_detection，如果有需要，自己手动指定某个field为date类型。
+
+    PUT /index_demo/_mapping
+    {
+        "date_detection": false
+    }
+    
+    
+#### 定制自己的dynamic mapping template
+
+    PUT /index_demo
+    {
+      "mappings": {
+        "dynamic_templates": [
+          {
+            "en": {
+              "match": "*_en",
+              "match_mapping_type": "string",
+              "mapping": {
+                "type": "text",
+                "analyzer": "english"
+              }
+            }
+          }
+        ]
+      }
+    }
+
+测试   
+   
+    PUT index_demo/_doc/1
+    {
+     "title":"this is my first article"
+    }
+    
+    PUT index_demo/_doc/2
+    {
+     "title_en":"this is my first article"
+    }
+    
+    GET /index_demo/_search
+    {
+      "query":{
+        "match": {
+          "title": "is"
+        }
+      }
+    }
+
+title没有匹配到任何的dynamic模板，默认就是standard分词器，不会过滤停用词，is会进入倒排索引，用is来搜索是可以搜索到的；
+title_en匹配到了dynamic模板，就是english分词器，会过滤停用词，is这种停用词就会被过滤掉，用is来搜索就搜索不到了；
+    
+    
+### 6.6 基于scoll+bulk+索引别名实现零停机重建索引
+
+#### 重建索引
+
+一个field的设置是不能被修改的，如果要修改一个Field，那么应该重新按照新的mapping，建立一个index，然后将数据批量查询出来，重新用bulk api写入index中；
+批量查询的时候，建议采用scroll api，并且采用多线程并发的方式来reindex数据，每次scoll就查询指定日期的一段数据，交给一个线程即可；
+
+举个例子：
+
+（1）一开始，依靠dynamic mapping，插入数据，但是不小心有些数据是2017-01-01这种日期格式的，所以title这种field被自动映射为了date类型，实际上它应该是string类型的。
+
+    PUT /index_demo/_doc/1
+    {
+      "title":"2020-01-01"
+    }
+    
+    PUT /index_demo/_doc/2
+    {
+      "title":"2020-01-02"
+    }
+
+（2）当后期向索引中加入string类型的title值的时候，就会报错。
+
+    PUT /index_demo/_doc/3
+    {
+      "title":"es 入门"
+    }
+
+（3）如果此时想修改title的类型，是不可能的
+
+    PUT /index_demo/_mapping
+    {
+      "properties":{
+        "title":{
+          "type":"text"
+        }
+      }
+    }
+
+（4）此时，唯一的办法，就是进行reindex，也就是说，重新建立一个索引，将旧索引的数据查询出来，再导入新索引
+
+（5）如果旧索引的名字是old_index，新索引的名字是new_index，终端java应用，已经在使用old_index在操作了，难道还要去停止java应用，修改使用的index为new_index，才重新启动java应用吗？这个过程中，就会导致java应用停机，可用性降低
+
+（6）所以说，给java应用一个别名，这个别名是指向旧索引的，java应用先用着，java应用先用goods_index alias来操作，此时实际指向的是旧的my_index
+
+    PUT /index_demo/_alias/goods_index
+
+（7）新建一个index，调整其title的类型为string
+
+    PUT /index_demo_new
+    {
+      "mappings": {
+        "properties": {
+          "title":{
+            "type":"text"
+          }
+        }
+      }
+    }
+
+（8）使用scroll api将数据批量查询出来
+
+    GET /index_demo/_search?scroll=1m
+    {
+      "query": {
+        "match_all": {}
+      },
+      "sort": ["_doc"],
+      "size": 1
+    }
+
+（9）采用bulk api将scoll查出来的一批数据，批量写入新索引
+
+    POST /_bulk
+    {"index":{"_index":"index_demo_new", "_id":"1"}}
+    {"title":"2020-01-01"}
+
+（10）反复循环8~9，查询一批又一批的数据出来，采取bulk api将每一批数据批量写入新索引
+
+（11）将goods_index alias切换到my_index_new上去，java应用会直接通过index别名使用新的索引中的数据，java应用程序不需要停机，零提交，高可用
+
+    POST /_aliases
+    {
+      "actions": [
+        {
+          "remove": {
+            "index": "index_demo",
+            "alias": "goods_index"
+          }
+        },
+        {
+          "add": {
+            "index": "index_demo_new",
+            "alias": "goods_index"
+          }
+        }
+      ]
+    }
+
+（12）直接通过goods_index别名来查询，是否ok
+
+
+
+ 
+    
