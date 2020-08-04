@@ -2351,3 +2351,298 @@ title_en匹配到了dynamic模板，就是english分词器，会过滤停用词�
 
  
     
+    
+## 七、内核原理
+
+### 7.1 倒排索引组成结构以及其索引不可变原因
+
+倒排索引，是适合用于进行搜索的
+
+倒排索引的结构：
+
+1. 包含这个关键词的document list
+2. 包含这个关键词的所有document的数量：IDF（inverse document frequency）
+3. 这个关键词在每个document中出现的次数：TF（term frequency）
+4. 这个关键词在这个document中的次序
+5. 每个document的长度：length norm
+6. 包含这个关键词的所有document的平均长度
+
+
+    word		doc1		doc2
+    
+    dog		     *		     *
+    hello		 *
+    you				         *
+
+倒排索引不可变的好处
+
+1. 不需要锁，提升并发能力，避免锁的问题
+2. 数据不变，一直保存在os cache中，只要cache内存足够
+3. filter cache一直驻留在内存，因为数据不变
+4. 可以压缩，节省cpu和io开销
+
+倒排索引不可变的坏处：每次都要重新构建整个索引
+
+### 7.2 图解剖析document写入原理（buffer，segment，commit）
+
+#### 基本流程
+
+![](./image/document写入原理.png)
+
+1. 数据写入buffer
+2. commit point
+3. buffer中的数据写入新的index segment
+4. 等待在os cache中的index segment被fsync强制刷到磁盘上
+5. 新的index sgement被打开，供search使用
+6. buffer被清空
+
+每次commit point时，会有一个.del文件，标记了哪些segment中的哪些document被标记为deleted;
+搜索的时候，会依次查询所有的segment，从旧的到新的，比如被修改过的document，在旧的segment中，会标记为deleted，在新的segment中会有其新的数据
+
+#### 优化后的流程
+在基础流程中通常写入磁盘是比较耗时，因此无法实现NTR近实时的查询。主要瓶颈在于fsync实际发生磁盘IO写数据进磁盘，是很耗时的。
+
+写入流程别改进如下：
+
+（1）数据写入buffer
+（2）每隔一定时间，buffer中的数据被写入segment文件，但是先写入os cache
+（3）只要segment写入os cache，那就直接打开供search使用，不立即执行commit
+
+数据写入os cache，并被打开供搜索的过程，叫做refresh，默认是每隔1秒refresh一次。
+也就是说，每隔一秒就会将buffer中的数据写入一个新的index segment file，先写入os cache中。
+所以，es是近实时的，数据写入到可以被搜索，默认是1秒。
+
+`POST /index_demo/_refresh`，可以手动refresh，一般不需要手动执行，没必要，让es自己搞就可以了
+
+比如现在的时效性要求，比较低，只要求一条数据写入es，一分钟以后才让我们搜索到就可以了，那么就可以调整refresh interval
+
+    PUT /index_demo
+    {
+      "settings": {
+        "refresh_interval": "30s" 
+      }
+    }
+
+#### 最终优化流程
+
+![](./image/document写入原理最终版.png)
+
+1. 数据写入buffer缓冲和translog日志文件
+2. 每隔一秒钟，buffer中的数据被写入新的segment file，并进入os cache，此时segment被打开并供search使用
+3. buffer被清空
+4. 重复1~3，新的segment不断添加，buffer不断被清空，而translog中的数据不断累加
+5. 当translog长度达到一定程度的时候，commit操作发生
+
+5-1. buffer中的所有数据写入一个新的segment，并写入os cache，打开供使用
+5-2. buffer被清空
+5-3. 一个commit ponit被写入磁盘，标明了所有的index segment
+5-4. filesystem cache中的所有index segment file缓存数据，被fsync强行刷到磁盘上
+5-5. 现有的translog被清空，创建一个新的translog
+
+#### 基于translog和commit point，如何进行数据恢复
+
+fsync+清空translog，就是flush，默认每隔30分钟flush一次，或者当translog过大的时候，也会flush
+
+`POST /index_demo/_flush`，一般来说别手动flush，让它自动执行就可以了
+
+translog，每隔5秒被fsync一次到磁盘上。在一次增删改操作之后，当fsync在primary shard和replica shard都成功之后，那次增删改操作才会成功
+
+但是这种在一次增删改时强行fsync translog可能会导致部分操作比较耗时，也可以允许部分数据丢失，设置异步fsync translog
+
+    PUT /index_demo/_settings
+    {
+        "index.translog.durability": "async",
+        "index.translog.sync_interval": "5s"
+    }
+
+
+#### 最后优化写入流程实现海量磁盘文件合并（segment merge，optimize）
+每秒一个segment file，文件过多，而且每次search都要搜索所有的segment，很耗时
+
+默认会在后台执行segment merge操作，在merge的时候，被标记为deleted的document也会被彻底物理删除
+
+每次merge操作的执行流程
+
+1. 选择一些有相似大小的segment，merge成一个大的segment
+2. 将新的segment flush到磁盘上去
+3. 写一个新的commit point，包括了新的segment，并且排除旧的那些segment
+4. 将新的segment打开供搜索
+5. 将旧的segment删除
+
+`POST /index_demo/_optimize?max_num_segments=1`，尽量不要手动执行，让它自动默认执行就可以了
+
+## 八、Java API初步使用
+
+### CRUD
+
+#### 老版本（下面的方法都是过期的，在es8开始将会被移除）
+
+引入maven依赖：
+
+    <dependency>
+        <groupId>org.elasticsearch.client</groupId>
+        <artifactId>transport</artifactId>
+        <version>7.8.1</version>
+    </dependency>
+
+添加日志依赖（可选）：
+
+    <dependency>
+        <groupId>org.apache.logging.log4j</groupId>
+        <artifactId>log4j-api</artifactId>
+        <version>2.13.3</version>
+    </dependency>
+    <dependency>
+        <groupId>org.apache.logging.log4j</groupId>
+        <artifactId>log4j-core</artifactId>
+        <version>2.13.3</version>
+    </dependency>
+
+代码测试
+
+    public static void main(String[] args) throws Exception {
+
+        // 构建client
+        Settings settings = Settings.builder()
+                .put("cluster.name", "docker-cluster")
+                .build();
+        TransportClient client = new PreBuiltTransportClient(settings)
+                .addTransportAddress(new TransportAddress(InetAddress.getByName("192.168.111.40"), 9300));
+
+        //addDoc(client);
+        //getDoc(client);
+        //updateDoc(client);
+        delDoc(client);
+        
+        client.close();
+    }
+
+    /**
+     * 添加
+     */
+    public static void addDoc(TransportClient client) throws IOException {
+        IndexResponse response = client.prepareIndex("employee", "_doc", "1")
+                .setSource(XContentFactory.jsonBuilder()
+                        .startObject()
+                        .field("user", "tom")
+                        .field("age", 18)
+                        .field("position", "scientist")
+                        .field("country", "China")
+                        .field("join_data", "2020-01-01")
+                        .field("salary", 10000)
+                        .endObject())
+                .get();
+        System.out.println(response.getResult());
+    }
+
+    /**
+     * 查询
+     */
+    public static void getDoc(TransportClient client){
+        GetResponse documentFields = client.prepareGet("employee", "_doc", "1").get();
+        System.out.println(documentFields.getSourceAsString());
+    }
+
+    /**
+     * 更新
+     */
+    public static void updateDoc(TransportClient client) throws IOException {
+        UpdateResponse response = client.prepareUpdate("employee", "_doc", "1")
+                .setDoc(XContentFactory.jsonBuilder()
+                        .startObject()
+                        .field("salary", 1000000)
+                        .endObject())
+                .get();
+        System.out.println(response.getResult());
+    }
+
+    /**
+     * 删除
+     */
+    public static void delDoc(TransportClient client){
+        DeleteResponse response = client.prepareDelete("employee", "_doc", "1").get();
+        System.out.println(response);
+    }
+
+#### 新版本
+
+添加maven依赖：
+
+    <dependency>
+        <groupId>org.elasticsearch.client</groupId>
+        <artifactId>elasticsearch-rest-high-level-client</artifactId>
+        <version>7.8.1</version>
+    </dependency>
+
+代码测试
+
+    public static void main(String[] args) throws IOException {
+        HttpHost[] httpHost = {HttpHost.create("192.168.111.40:9200")};
+        RestHighLevelClient restHighLevelClient = new RestHighLevelClient(RestClient.builder(httpHost));
+        // addDoc(restHighLevelClient);
+        // getDoc(restHighLevelClient);
+        // updateDoc(restHighLevelClient);
+        delDoc(restHighLevelClient);
+
+        restHighLevelClient.close();
+    }
+
+    /**
+     * 添加
+     */
+    public static void addDoc(RestHighLevelClient client) throws IOException {
+        IndexRequest request = new IndexRequest("employee");
+        request.id("1");
+        request.source(XContentFactory.jsonBuilder()
+                .startObject()
+                .field("user", "tom")
+                .field("age", 18)
+                .field("position", "scientist")
+                .field("country", "China")
+                .field("join_data", "2020-01-01")
+                .field("salary", 10000)
+                .endObject());
+        IndexResponse response = client.index(request, RequestOptions.DEFAULT);
+        System.out.println(response.getResult());
+    }
+
+    /**
+     * 查询
+     */
+    public static void getDoc(RestHighLevelClient client) throws IOException {
+        // 通过ID来查询
+        GetRequest request = new GetRequest("employee","1");
+        GetResponse response = client.get(request, RequestOptions.DEFAULT);
+        // 更丰富的查询条件
+        /// SearchRequest searchRequest = new SearchRequest();
+        /// client.search(searchRequest, RequestOptions.DEFAULT);
+
+        System.out.println(response.getSourceAsString());
+    }
+
+    /**
+     * 更新
+     */
+    public static void updateDoc(RestHighLevelClient client) throws IOException {
+        UpdateRequest request = new UpdateRequest("employee", "1");
+        request.doc(XContentFactory.jsonBuilder()
+                .startObject()
+                .field("salary", 1000000)
+                .endObject());
+        UpdateResponse response = client.update(request, RequestOptions.DEFAULT);
+        System.out.println(response.getResult());
+    }
+
+    /**
+     * 删除
+     */
+    public static void delDoc(RestHighLevelClient client) throws IOException {
+        DeleteRequest request = new DeleteRequest("employee", "1");
+        DeleteResponse response = client.delete(request, RequestOptions.DEFAULT);
+        System.out.println(response);
+    }  
+
+
+    
+      
+   
