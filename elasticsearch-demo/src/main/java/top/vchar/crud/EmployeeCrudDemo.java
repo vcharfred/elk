@@ -10,6 +10,8 @@ import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.transport.TransportAddress;
 import org.elasticsearch.common.xcontent.XContentFactory;
 import org.elasticsearch.index.query.QueryBuilders;
+import org.elasticsearch.search.aggregations.AggregationBuilders;
+import org.elasticsearch.search.aggregations.bucket.histogram.DateHistogramInterval;
 import org.elasticsearch.transport.client.PreBuiltTransportClient;
 
 import java.io.IOException;
@@ -37,7 +39,8 @@ public class EmployeeCrudDemo {
 //        getDoc(client);
 //        updateDoc(client);
 //        delDoc(client);
-        search(client);
+//        search(client);
+        search2(client);
         client.close();
     }
 
@@ -83,15 +86,34 @@ public class EmployeeCrudDemo {
     /**
      * 删除
      */
-    public static void delDoc(TransportClient client){
+    public static void delDoc(TransportClient client) {
         DeleteResponse response = client.prepareDelete("employee", "_doc", "1").get();
         System.out.println(response);
     }
 
-    public static void search(TransportClient client){
+    /***
+     * 查询职位中包含scientist，并且年龄在28到40岁之间
+     */
+    public static void search(TransportClient client) {
         SearchResponse response = client.prepareSearch("employee")
                 .setQuery(QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("position", "scientist"))
                         .filter(QueryBuilders.rangeQuery("age").gte(28).lte(40))).setFrom(0).setSize(2).get();
+        System.out.println(response);
+    }
+
+    /***
+     * 聚合查询
+     */
+    public static void search2(TransportClient client) {
+        SearchResponse response = client.prepareSearch("employee")
+                .addAggregation(AggregationBuilders.terms("group_by_country")
+                        .field("country")
+                        .subAggregation(AggregationBuilders.dateHistogram("group_by_join_date")
+                                .field("joinDate")
+                                .dateHistogramInterval(DateHistogramInterval.YEAR)
+                                .subAggregation(AggregationBuilders.avg("avg_salary").field("salary")))
+                ).execute().actionGet();
+
         System.out.println(response);
     }
 }

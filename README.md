@@ -1795,6 +1795,26 @@ bool，must，must_not，should，filter
 在建立索引的时候，一方面会建立倒排索引，以供搜索用；一方面会建立正排索引，也就是doc values，以供排序，聚合，过滤等操作使用；
 doc values是被保存在磁盘上的，此时如果内存足够，os会自动将其缓存在内存中，性能还是会很高；如果内存不足够，os会将其写入磁盘上；
 
+倒排索引类似如下（对每个字段进行操作）：
+
+    doc1的content字段内容: hello world you and me
+    doc2的content字段内容: hi, world, how are you
+    
+    word		doc1	doc2
+    hello		*
+    world		*		*
+    .......
+
+正排索引类似如下（对整个文档进行操作）：
+    
+    doc1内容: { "name": "jack", "age": 27 }
+    doc2内容: { "name": "tom", "age": 30 }
+    
+    document	name		age
+    doc1		jack		27
+    doc2		tom		    30	
+
+
 ### 5.23 分布式搜索引擎内核解密之query phase
 #### query phase
 
@@ -2346,11 +2366,6 @@ title_en匹配到了dynamic模板，就是english分词器，会过滤停用词�
     }
 
 （12）直接通过goods_index别名来查询，是否ok
-
-
-
- 
-    
     
 ## 七、内核原理
 
@@ -2563,6 +2578,80 @@ translog，每隔5秒被fsync一次到磁盘上。在一次增删改操作之后
         DeleteResponse response = client.prepareDelete("employee", "_doc", "1").get();
         System.out.println(response);
     }
+    
+    /***
+     * 查询职位中包含scientist，并且年龄在28到40岁之间
+     */
+    public static void search(TransportClient client){
+        SearchResponse response = client.prepareSearch("employee")
+                .setQuery(QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("position", "scientist"))
+                        .filter(QueryBuilders.rangeQuery("age").gte(28).lte(40))).setFrom(0).setSize(2).get();
+        System.out.println(response);
+    }
+    
+    /***
+     * 聚合查询(需要重建mapping)
+     */
+    public static void search2(TransportClient client){
+        SearchResponse response = client.prepareSearch("employee")
+                .addAggregation(AggregationBuilders.terms("group_by_country")
+                        .field("country")
+                        .subAggregation(AggregationBuilders.dateHistogram("group_by_join_date")
+                                .field("joinDate")
+                                .dateHistogramInterval(DateHistogramInterval.YEAR)
+                                .subAggregation(AggregationBuilders.avg("avg_salary").field("salary")))
+                ).execute().actionGet();
+
+        System.out.println(response);
+    }
+
+> 重建mapping语句：
+
+    PUT /employee
+    {
+      "mappings": {
+        "properties": {
+          "age": {
+            "type": "long"
+          },
+          "country": {
+            "type": "text",
+            "fields": {
+              "keyword": {
+                "type": "keyword",
+                "ignore_above": 256
+              }
+            },
+            "fielddata": true
+          },
+          "joinData": {
+            "type": "date"
+          },
+          "name": {
+            "type": "text",
+            "fields": {
+              "keyword": {
+                "type": "keyword",
+                "ignore_above": 256
+              }
+            }
+          },
+          "position": {
+            "type": "text",
+            "fields": {
+              "keyword": {
+                "type": "keyword",
+                "ignore_above": 256
+              }
+            }
+          },
+          "salary": {
+            "type": "long"
+          }
+        }
+      }
+    }
+
 
 #### 新版本
 
@@ -2641,7 +2730,21 @@ translog，每隔5秒被fsync一次到磁盘上。在一次增删改操作之后
         DeleteResponse response = client.delete(request, RequestOptions.DEFAULT);
         System.out.println(response);
     }  
-
+    
+     /**
+     * 查询职位中包含scientist，并且年龄在28到40岁之间
+     */
+     public static void search(RestHighLevelClient client) throws IOException {
+        SearchRequest request = new SearchRequest("employee");
+        request.source(SearchSourceBuilder.searchSource()
+                .query(QueryBuilders.boolQuery()
+                        .must(QueryBuilders.matchQuery("position", "scientist"))
+                        .filter(QueryBuilders.rangeQuery("age").gte("28").lte("28"))
+                ).from(0).size(2)
+        );
+        SearchResponse search = client.search(request, RequestOptions.DEFAULT);
+        System.out.println(JSONObject.toJSONString(search.getHits()));
+     }
 
     
       

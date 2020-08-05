@@ -5,10 +5,14 @@ import org.apache.http.HttpHost;
 import org.elasticsearch.action.bulk.BulkRequest;
 import org.elasticsearch.action.bulk.BulkResponse;
 import org.elasticsearch.action.index.IndexRequest;
+import org.elasticsearch.action.search.SearchRequest;
+import org.elasticsearch.action.search.SearchResponse;
 import org.elasticsearch.client.RequestOptions;
 import org.elasticsearch.client.RestClient;
 import org.elasticsearch.client.RestHighLevelClient;
 import org.elasticsearch.common.xcontent.XContentType;
+import org.elasticsearch.index.query.QueryBuilders;
+import org.elasticsearch.search.builder.SearchSourceBuilder;
 import top.vchar.entity.Employee;
 
 import java.io.IOException;
@@ -27,7 +31,7 @@ public class SearchDemo {
     public static void main(String[] args) {
         try(RestHighLevelClient client = new RestHighLevelClient(RestClient.builder(new HttpHost("192.168.111.40", 9200)))){
             initDoc(client);
-//            search(client);
+            search(client);
         }catch (Exception e){
             e.printStackTrace();
         }
@@ -72,10 +76,18 @@ public class SearchDemo {
 
 
     /**
-     * 查询
+     * 查询职位中包含scientist，并且年龄在28到40岁之间
      */
-    public static void search(RestHighLevelClient client){
-
+    public static void search(RestHighLevelClient client) throws IOException {
+        SearchRequest request = new SearchRequest("employee");
+        request.source(SearchSourceBuilder.searchSource()
+                .query(QueryBuilders.boolQuery()
+                        .must(QueryBuilders.matchQuery("position", "scientist"))
+                        .filter(QueryBuilders.rangeQuery("age").gte("28").lte("28"))
+                ).from(0).size(2)
+        );
+        SearchResponse search = client.search(request, RequestOptions.DEFAULT);
+        System.out.println(JSONObject.toJSONString(search.getHits()));
     }
 
 
