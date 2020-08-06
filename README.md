@@ -154,7 +154,7 @@ kibana的界面可以很方便的查看elasticsearch的信息，也可以做图�
     # 启动kibana
     docker run -d --name kibana --link 已经启动的elasticsearch的容器ID或者是名字:elasticsearch -p 5601:5601 kibana:7.8.0  
     # 例如
-    docker run -d --name kibana --link 074c8527cecd:elasticsearch -p 5601:5601 kibana:7.8.0
+    docker run -d --name kibana --link es7:elasticsearch -p 5601:5601 kibana:7.8.0
 
 通过`http://192.168.111.44:5601`访问kibana
 
@@ -3001,4 +3001,30 @@ es不停机，直接我们在外部某个地方添加新的词语，es中立即�
           ]
         }
       }
-    }      
+    } 
+
+#### 统计当前距离多远的酒店数
+
+    GET /hotel/_search
+    {
+    "size": 0, 
+      "aggs": {
+        "agg_by_distance_range": {
+          "geo_distance": {
+            "field": "location",
+            "origin": {
+              "lat": 30,
+              "lon": 106
+            },
+            "unit": "mi", 
+            "ranges": [
+              {
+                "from": 100,
+                "to": 300
+              }
+            ]
+          }
+        }
+      }
+    }
+     
