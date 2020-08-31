@@ -65,7 +65,7 @@ Kibana是一个基于Web的图形界面，用于搜索、分析和可视化存�
 
 国内
 
-    （9）国内：站内搜索（电商，招聘，门户，等等），IT系统搜索（OA，CRM，ERP，等等），数据分析（ES热门的一个使用场景）
+ （9）国内：站内搜索（电商，招聘，门户，等等），IT系统搜索（OA，CRM，ERP，等等），数据分析（ES热门的一个使用场景）
 
 ### 1.3 elasticsearch的核心概念
 
@@ -95,8 +95,7 @@ Kibana是一个基于Web的图形界面，用于搜索、分析和可视化存�
 
 1. 拉取docker镜像，由于国内网络原因，速度可能会比较慢或者无法下载；可以直接安装对应系统的安装包进行安装即可，基本都是解压运行即可。
 
-
-	docker pull elasticsearch:7.8.0
+    	docker pull elasticsearch:7.8.0
 
 > 镜像下载慢可以配置国内的加速
 
@@ -119,7 +118,7 @@ Kibana是一个基于Web的图形界面，用于搜索、分析和可视化存�
 2. 创建elasticsearch容器，并启动(这里使用单机版)
 
 
-    docker run -d --name es7  -p 9200:9200 -p 9300:9300 -e "discovery.type=single-node" elasticsearch:7.8.0
+        docker run -d --name es7  -p 9200:9200 -p 9300:9300 -e "discovery.type=single-node" elasticsearch:7.8.0
 
 3. 访问 `http://192.168.1.6:9200/`
 
@@ -2748,10 +2747,6 @@ translog，每隔5秒被fsync一次到磁盘上。在一次增删改操作之后
         System.out.println(JSONObject.toJSONString(search.getHits()));
      }
 
-    
-      
-   
-
 ## 九、深度探索搜索技术
 
 ## 十、IK中文分词器
@@ -2881,7 +2876,7 @@ es不停机，直接我们在外部某个地方添加新的词语，es中立即�
 
     PUT /hotel/_doc/3
     {
-      "name":"北京天安门",
+      "name":"北京天安门广场",
       "location":{
         "lat":39.909187,
         "lon":116.397451
@@ -2941,7 +2936,7 @@ es不停机，直接我们在外部某个地方添加新的词语，es中立即�
       }
     } 
 
-#### 多个点组成的多边型内
+#### 搜索多个点组成的多边型内
 
     GET /hotel/_search
     {
@@ -2976,7 +2971,7 @@ es不停机，直接我们在外部某个地方添加新的词语，es中立即�
       }
     }    
 
-#### 搜索范围内的 
+#### 搜索指定坐标100km范围内的 
 
     GET /hotel/_search
     {
@@ -3003,7 +2998,7 @@ es不停机，直接我们在外部某个地方添加新的词语，es中立即�
       }
     } 
 
-#### 统计当前距离多远的酒店数
+#### 统计距离100~300米内的酒店数
 
     GET /hotel/_search
     {
