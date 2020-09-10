@@ -29,12 +29,17 @@ import java.util.List;
 public class SearchDemo {
 
     public static void main(String[] args) {
-        try(RestHighLevelClient client = new RestHighLevelClient(RestClient.builder(new HttpHost("192.168.111.40", 9200)))){
+        try (RestHighLevelClient client = new RestHighLevelClient(RestClient.builder(new HttpHost("192.168.111.40", 9200)))) {
             initDoc(client);
             search(client);
-        }catch (Exception e){
+        } catch (Exception e) {
             e.printStackTrace();
         }
+
+//        RestHighLevelClient client = new RestHighLevelClient(RestClient
+//                .builder(new HttpHost("192.168.111.40", 9200)
+//                        , new HttpHost("192.168.111.41", 9200)));
+
     }
 
     /**

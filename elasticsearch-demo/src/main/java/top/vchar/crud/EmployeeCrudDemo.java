@@ -31,6 +31,8 @@ public class EmployeeCrudDemo {
         // 构建client
         Settings settings = Settings.builder()
                 .put("cluster.name", "docker-cluster")
+                // 设置集群节点自动发现
+//                .put("client.transport.sniff", true)
                 .build();
         TransportClient client = new PreBuiltTransportClient(settings)
                 .addTransportAddress(new TransportAddress(InetAddress.getByName("192.168.111.40"), 9300));
