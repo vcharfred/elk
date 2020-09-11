@@ -6709,12 +6709,311 @@ dyanmic mapping template，动态映射模板
 然后通过集群状态自动获取当前集群中的所有data node，然后用这份完整的列表更新自己内部要发送请求的node list。
 默认每隔5秒钟，就会更新一次node list。
 
+        // 老版本的写法
+        Settings settings = Settings.builder()
+                .put("cluster.name", "docker-cluster")
+                // 设置集群节点自动发现
+                .put("client.transport.sniff", true)
+                .build();
+
 注意，es client是不会将Master node纳入node list的，因为要避免给master node发送搜索等请求。
 
 这样的话，我们其实直接就指定几个master node，或者1个node就好了，client会自动去探查集群的所有节点，而且每隔5秒还会自动刷新。
 
+### 15.2 基于upsert实现汽车最新价格的调整
+
+建立mapper
+
+    PUT /car_shop
+    {
+      "mappings": {
+          "properties": {
+            "brand": {
+              "type": "text",
+              "analyzer": "ik_max_word",
+              "fields": {
+                "raw": {
+                  "type": "keyword"
+                }
+              }
+            },
+            "name": {
+              "type": "text",
+              "analyzer": "ik_max_word",
+              "fields": {
+                "raw": {
+                  "type": "keyword"
+                }
+              }
+            }
+          }
+        }
+    }
+
+Java代码实现存在则更新否则添加
+
+    IndexRequest indexRequest = new IndexRequest("car_shop");
+            indexRequest.id("1");
+            indexRequest.source(XContentFactory.jsonBuilder()
+                    .startObject()
+                    .field("brand", "宝马")
+                    .field("name", "宝马320")
+                    .field("price", 320000)
+                    .field("produce_date", "2020-01-01")
+                    .endObject());
+    
+    UpdateRequest updateRequest = new UpdateRequest("car_shop", "1");
+    updateRequest.doc(XContentFactory.jsonBuilder()
+            .startObject()
+            .field("price", 320000)
+            .endObject()).upsert(indexRequest);
+
+    UpdateResponse response = restHighLevelClient.update(updateRequest, RequestOptions.DEFAULT);
+    System.out.println(response.getResult());
+
+### 15.3 基于mget实现多辆汽车的配置与价格对比
+
+场景：一般我们都可以在一些汽车网站上，或者在混合销售多个品牌的汽车4S店的内部，都可以在系统里调出来多个汽车的信息，放在网页上，进行对比
+
+mget：一次性将多个document的数据查询出来，放在一起显示。
+
+    PUT /car_shop/_doc/2
+    {
+        "brand": "奔驰",
+        "name": "奔驰C200",
+        "price": 350000,
+        "produce_date": "2020-01-05"
+    }
+
+Java代码：
+
+    MultiGetRequest multiGetRequest = new MultiGetRequest();
+    multiGetRequest.add("car_shop", "1");
+    multiGetRequest.add("car_shop", "2");
+
+    MultiGetResponse multiGetResponse = restHighLevelClient.mget(multiGetRequest, RequestOptions.DEFAULT);
+    MultiGetItemResponse[] responses = multiGetResponse.getResponses();
+    for(MultiGetItemResponse response:responses){
+        System.out.println(response.getResponse().getSourceAsMap());
+    }
+
+### 15.4 基于bulk实现多4S店销售数据批量上传
+
+业务场景：有一个汽车销售公司，拥有很多家4S店，这些4S店的数据，都会在一段时间内陆续传递过来，汽车的销售数据，
+现在希望能够在内存中缓存比如1000条销售数据，然后一次性批量上传到es中去。
+
+Java代码：
+
+    BulkRequest bulkRequest = new BulkRequest();
+
+    // 添加数据
+    JSONObject car = new JSONObject();
+    car.put("brand", "奔驰");
+    car.put("name", "奔驰C200");
+    car.put("price", 350000);
+    car.put("produce_date", "2020-01-05");
+    car.put("sale_price", 360000);
+    car.put("sale_date", "2020-02-03");
+    bulkRequest.add(new IndexRequest("car_sales").id("3").source(car.toJSONString(), XContentType.JSON));
+
+    // 更新数据
+    bulkRequest.add(new UpdateRequest("car_shop", "2").doc(jsonBuilder()
+            .startObject()
+            .field("sale_price", "290000")
+            .endObject()));
+
+    // 删除数据
+    bulkRequest.add(new DeleteRequest("car_shop").id("1"));
+
+    BulkResponse bulk = restHighLevelClient.bulk(bulkRequest, RequestOptions.DEFAULT);
+    System.out.println(bulk.hasFailures() +" " +bulk.buildFailureMessage());
+
+### 15.5 基于scroll实现月度销售数据批量下载
+
+当需要从es中下载大批量的数据时，比如说做业务报表时需要将数据导出到Excel中，如果数据有几十万甚至是上百万条数据，此时可以使用scroll对大量的数据批量的获取和处理
 
 
+    // 创建查询请求，设置index
+    SearchRequest searchRequest = new SearchRequest("car_shop");
+    // 设定滚动时间间隔,60秒,不是处理查询结果的所有文档的所需时间
+    // 游标查询的过期时间会在每次做查询的时候刷新，所以这个时间只需要足够处理当前批的结果就可以了
+    searchRequest.scroll(TimeValue.timeValueMillis(60000));
+
+    // 构建查询条件
+    SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+    searchSourceBuilder.query(QueryBuilders.matchQuery("brand", "奔驰"));
+    // 每个批次实际返回的数量
+    searchSourceBuilder.size(2);
+    searchRequest.source(searchSourceBuilder);
+
+    SearchResponse searchResponse = restHighLevelClient.search(searchRequest, RequestOptions.DEFAULT);
+
+    // 获取第一页的
+    String scrollId = searchResponse.getScrollId();
+    SearchHit[] searchHits = searchResponse.getHits().getHits();
+
+    int page = 1;
+    //遍历搜索命中的数据，直到没有数据
+    while (searchHits != null && searchHits.length > 0) {
+        System.out.println(String.format("--------第%s页-------", page++));
+        for (SearchHit searchHit : searchHits) {
+            System.out.println(searchHit.getSourceAsString());
+        }
+        System.out.println("=========================");
+
+        SearchScrollRequest scrollRequest = new SearchScrollRequest(scrollId);
+        scrollRequest.scroll(TimeValue.timeValueMillis(60000));
+        try {
+            searchResponse = restHighLevelClient.scroll(scrollRequest, RequestOptions.DEFAULT);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        scrollId = searchResponse.getScrollId();
+        searchHits = searchResponse.getHits().getHits();
+    }
+
+    // 清除滚屏任务
+    ClearScrollRequest clearScrollRequest = new ClearScrollRequest();
+    // 也可以选择setScrollIds()将多个scrollId一起使用
+    clearScrollRequest.addScrollId(scrollId);
+    ClearScrollResponse clearScrollResponse = restHighLevelClient.clearScroll(clearScrollRequest,RequestOptions.DEFAULT);
+    System.out.println("succeeded:" + clearScrollResponse.isSucceeded());
+
+> 所有数据获取完毕之后，需要手动清理掉 scroll_id 。
+> 虽然es 会有自动清理机制，但是 scroll_id 的存在会耗费大量的资源来保存一份当前查询结果集映像，并且会占用文件描述符。所以用完之后要及时清理
+
+### 15.6 基于search template实现按品牌分页查询模板
+
+    Map<String, Object> params = new HashMap<>(1);
+    params.put("brand", "奔驰");
+
+    SearchTemplateRequest templateRequest = new SearchTemplateRequest();
+    templateRequest.setScript("{\n" +
+            "  \"query\": {\n" +
+            "    \"match\": {\n" +
+            "      \"brand\": \"{{brand}}\" \n" +
+            "    }\n" +
+            "  }\n" +
+            "}\n");
+    templateRequest.setScriptParams(params);
+    templateRequest.setScriptType(ScriptType.INLINE);
+    templateRequest.setRequest(new SearchRequest("car_shop"));
+
+    SearchTemplateResponse templateResponse = restHighLevelClient.searchTemplate(templateRequest, RequestOptions.DEFAULT);
+    SearchHit[] hits = templateResponse.getResponse().getHits().getHits();
+    if(null!=hits && hits.length!=0){
+        for (SearchHit hit : hits) {
+            System.out.println(hit.getSourceAsString());
+        }
+    }else {
+        System.out.println("无符合条件的数据");
+    }
+
+### 15.7 对汽车品牌进行全文检索、精准查询和前缀搜索
+
+    @Test
+    public void fullSearch() throws IOException {
+        
+        SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+        searchSourceBuilder.query(QueryBuilders.matchQuery("brand", "奔驰"));
+        search(searchSourceBuilder);
+        System.out.println("-----------------------------");
+
+        searchSourceBuilder = new SearchSourceBuilder();
+        searchSourceBuilder.query(QueryBuilders.multiMatchQuery("宝马", "brand", "name"));
+        search(searchSourceBuilder);
+        System.out.println("-----------------------------");
+
+        searchSourceBuilder = new SearchSourceBuilder();
+        searchSourceBuilder.query(QueryBuilders.prefixQuery("name", "奔"));
+        search(searchSourceBuilder);
+        System.out.println("-----------------------------");
+
+    }
+
+    private void search(SearchSourceBuilder searchSourceBuilder) throws IOException {
+        SearchRequest searchRequest = new SearchRequest("car_shop");
+        searchRequest.source(searchSourceBuilder);
+        SearchResponse searchResponse = restHighLevelClient.search(searchRequest, RequestOptions.DEFAULT);
+        SearchHit[] searchHits = searchResponse.getHits().getHits();
+        if(searchHits!=null && searchHits.length!=0){
+            for (SearchHit searchHit : searchHits) {
+                System.out.println(searchHit.getSourceAsString());
+            }
+        }
+    }
+
+### 15.8 对汽车品牌进行多种的条件组合搜索
+
+    SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+        searchSourceBuilder.query(QueryBuilders.boolQuery()
+                .must(QueryBuilders.matchQuery("brand", "奔驰"))
+                .mustNot(QueryBuilders.termQuery("name.raw", "奔驰C203"))
+                .should(QueryBuilders.termQuery("produce_date", "2020-01-02"))
+                .filter(QueryBuilders.rangeQuery("price").gte("280000").lt("500000"))
+        );
+        
+    SearchRequest searchRequest = new SearchRequest("car_shop");
+    searchRequest.source(searchSourceBuilder);
+    SearchResponse searchResponse = restHighLevelClient.search(searchRequest, RequestOptions.DEFAULT);
+    SearchHit[] searchHits = searchResponse.getHits().getHits();
+    if(searchHits!=null && searchHits.length!=0){
+     for (SearchHit searchHit : searchHits) {
+         System.out.println(searchHit.getSourceAsString());
+     }
+    }
+
+### 基于地理位置对周围汽车4S店进行搜索
+
+需要将字段类型设置坐标类型
+
+    POST /car_shop/_mapping
+    {
+      "properties": {
+          "pin": {
+              "properties": {
+                  "location": {
+                      "type": "geo_point"
+                  }
+              }
+          }
+      }
+    }
+
+添加数据
+    
+    PUT /car_shop/_doc/5
+    {
+        "name": "上海至全宝马4S店",
+        "pin" : {
+            "location" : {
+                "lat" : 40.12,
+                "lon" : -71.34
+            }
+        }
+    }
+
+#### 搜索两个坐标点组成的一个区域
+
+    SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+    searchSourceBuilder.query(QueryBuilders.geoBoundingBoxQuery("pin.location")
+            .setCorners(40.73, -74.1, 40.01, -71.12));
+
+#### 指定一个区域，由三个坐标点，组成，比如上海大厦，东方明珠塔，上海火车站
+
+    searchSourceBuilder = new SearchSourceBuilder();
+    List<GeoPoint> points = new ArrayList<>();
+    points.add(new GeoPoint(40.73, -74.1));
+    points.add(new GeoPoint(40.01, -71.12));
+    points.add(new GeoPoint(50.56, -90.58));
+    searchSourceBuilder.query(QueryBuilders.geoPolygonQuery("pin.location", points));
+
+#### 搜索距离当前位置在200公里内的4s店
+
+    searchSourceBuilder = new SearchSourceBuilder();
+    searchSourceBuilder.query(QueryBuilders.geoDistanceQuery("pin.location")
+            .point(40, -70).distance(200, DistanceUnit.KILOMETERS));    
 
 
      
