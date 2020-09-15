@@ -7015,5 +7015,123 @@ Java代码：
     searchSourceBuilder.query(QueryBuilders.geoDistanceQuery("pin.location")
             .point(40, -70).distance(200, DistanceUnit.KILOMETERS));    
 
+## 十六、集群部署
+
+es集群部署需要考虑：内存(es对内存消耗比较大)、cpu、磁盘读写、网络
+
+> 一般数据量在10亿以内的规模，提供5台以上的机器，每台机器的配置到8核64G的配置，基本就合适了。
+
+如果业务量小的话，使用单机版的即可；需要集群的话建议直接购买成品（阿里云、腾讯云都有）；实际购买服务器的费用、带宽费用这些加起来自建集群
+可能会更贵。当然如果集群数量很大还是自建吧。
+
+但是如果一个小集群，就10个以内的节点，那就所有节点都可以作为master eligible node以及data node即可，超过10个node的集群再单独拆分master和data node吧
+
+如果你的节点数量小于10个，小集群，那所有的node，就不要做额外的配置了，master eligible node，同时也是data node
+
+### 16.1 为集群设置一些重要参数
+
+es的默认参数是非常好的，适合绝大多数的情况，尤其是一些性能相关的配置。因此刚开始部署一个生产环境下的es集群时，几乎所有的配置参数都可以用默认的设置。
+在es的性能调优中，真的很少有那种魔法调优，就是某个参数一调节，直接性能提升上百倍。
+即使有这种参数，es官方也早就将其设置为默认的最佳值了。
+
+但是在生产环境中，还是有极少数跟公司和业务相关的配置是需要我们修改的。这些设置是和公司、业务相关联的，是没法预先给予最好的默认配置的。
+
+#### 集群名称和节点名称
+
+默认情况下，es会启动一个名称为elasticsearch的集群。通常建议一定要将自己的集群名称重新进行命名，
+主要是为避免公司网络环境中，也许某个开发人员的开发机会无意中加入你的集群。
+比如说将你的集群名称命名为`elasticsearch_xxx`。在`elasticsearch.yml`中，可以设置集群名称：`cluster.name: elasticsearch_xxx`。
+
+此外，每个node启动的时候，es也会分配一个随机的名称。这个也不适合在生产环境中，因为这会导致我们没法记住每台机器。
+而且每次重启节点都会随机分配，就导致node名称每次重启都会变化。因此通常我们在生产环境中是需要给每个node都分配一个名称的。在elasticsearch.yml中配置即可：`node.name: elasticsearch_002_xx`。
+
+#### 文件路径
+
+* （1）数据目录、日志目录以及插件目录
+
+默认情况下，es会将plugin，log，还有data ，config，file都放在es的安装目录中。
+这有一个问题，就是在进行es升级的时候，可能会导致这些目录被覆盖掉。导致我们丢失之前安装好的plugin，已有的log，还有已有的数据，以及配置好的配置文件。
+
+所以一般建议在生产环境中，必须将这些重要的文件路径，都重新设置一下，放在es安装目录之外。
+
+    path.data：用于设置数据文件的目录；
+    path.logs：用于设置日志文件的目录
+    path.plugins：用于设置插件存放的目录
+
+> path.data可以指定多个目录，用逗号分隔即可。如果多个目录在不同的磁盘上，那么这就是一个最简单的RAID 0的方式，将数据在本地进行条带化存储了，可以提升整体的磁盘读写性能。es会自动将数据在多个磁盘的多个目录中条带化存储数据
+
+一般建议的目录地址是：
+
+    mkdir -p /var/log/elasticsearch
+    mkdir -p /var/data/elasticsearch
+    mkdir -p /var/plugin/elasticsearch
+    mkdir -p /etc/elasticsearch
+
+    path.logs: /var/log/elasticsearch
+    path.data: /var/data/elasticsearch
+    path.plugins: /var/plugin/elasticsearch
+
+    config：/etc/elasticsearch
+
+
+* （2）配置文件目录
+
+es有两个配置文件，elasticsearch.yml，用于配置es，还有一个log4j.properties用来配置es日志打印。
+这些文件都被放在config目录下，默认就是ES_HOME/config。可以通过下面的命令来重新设置：`./bin/elasticsearch -Epath.conf=/path/to/my/config/`。
+
+配置文件的格式是yaml格式的
+
+### 16.2 针对生产集群的脑裂问题专门定制的重要参数
+
+脑裂问题：简单来说就是一个集群中存在两个master，因为master是集群中非常重要的一个角色，主宰了集群状态的维护，以及shard的分配，因此如果有两个master，可能会导致数据破坏。
+
+`discovery.zen.minimum_master_nodes`：参数对于集群的可靠性来说，是非常重要的。这个设置可以预防脑裂问题，也就是一个集群中存在两个master。
+
+如果为做相关配置，假如因为网络的故障，导致一个集群被划分成了两片，每片都有多个node，以及一个master，那么集群中就出现了两个master了。
+那么那个参数的作用，就是告诉es直到有足够的master候选节点时，才可以选举出一个master，否则就不要选举出一个master。
+这个参数必须被设置为集群中master候选节点的quorum数量，也就是大多数。至于quorum的算法，就是：master候选节点数量 / 2 + 1。
+
+#### quorum数量计算举例：
+
+1. 有10个节点，都能维护数据，也可以是master候选节点，那么：quorum = 10/2+1 = 6。
+2. 有三个master候选节点，还有100个数据节点，那么：quorum= 3/2+1 = 2
+3. 有2个节点，都可以是master候选节点，那么：quorum= 2/2+1 = 2。
+此时就有问题了，因为如果一个node挂掉了，那么剩下一个master候选节点，是无法满足quorum数量的，也就无法选举出新的master，集群就彻底挂掉了。
+因此就只能将这个参数设置为1，但是这就无法阻止脑裂的发生了。
+
+#### 通过API修改quorum配置
+
+因为es集群是可以动态增加和下线节点的，所以可能随时会改变quorum。因此这个参数也是可以通过api随时修改的，特别是在节点上线和下线的时候，都需要作出对应的修改。而且一旦修改过后，这个配置就会持久化保存下来。
+
+    PUT /_cluster/settings
+    {
+        "persistent" : {
+            "discovery.zen.minimum_master_nodes" : 2
+        }
+    }
+
+### 16.3 针对集群重启时的shard恢复耗时过长问题定制的重要参数
+
+由于shard recovery配置以及集群重启时的无意义shard重分配问题会导致shard恢复耗时过长。
+
+#### 默认配置下，shard恢复过程
+
+![](./image/es集群重新启动慢的问题.png)
+
+在这个过程中，这些shard重新复制，移动，删除，再次移动的过程，会大量的耗费网络和磁盘资源。
+对于数据量庞大的集群，可能导致每次集群重启时，都有TB级别的数据无端移动，可能导致集群启动会耗费很长时间。
+
+但是如果所有的节点都可以等待整个集群中的所有节点都完全上线之后，所有的数据都有了以后，再决定是否要复制和移动shard，情况就会好很多。
+
+#### 设置`gateway.recover_after_nodes`、`gateway.expected_nodes`、`gateway.recover_after_time`参数来解决集群重启慢的问题
+
+* `gateway.recover_after_nodes`：这个参数可以让es直到有足够的node都上线之后，再开始shard recovery的过程，具体根据集群中节点的数量来决定；如：gateway.recover_after_nodes:5
+* `gateway.expected_nodes`：设置一个集群中至少要有多少个node；如：gateway.expected_nodes:10
+* `gateway.recover_after_time`：等待node的时间；如：gateway.recover_after_time:5m
+
+经过上面的配置之后，es集群的行为会变成下面这样，等待至少8个节点在线，然后等待最多5分钟，或者10个节点都在线，开始shard recovery的过程。
+这样就可以避免少数node启动时，就立即开始shard recovery，消耗大量的网络和磁盘资源，甚至可以将shard recovery过程从数小时缩短为数分钟。
+
+
 
      
