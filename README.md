@@ -7132,6 +7132,1678 @@ es有两个配置文件，elasticsearch.yml，用于配置es，还有一个log4j
 经过上面的配置之后，es集群的行为会变成下面这样，等待至少8个节点在线，然后等待最多5分钟，或者10个节点都在线，开始shard recovery的过程。
 这样就可以避免少数node启动时，就立即开始shard recovery，消耗大量的网络和磁盘资源，甚至可以将shard recovery过程从数小时缩短为数分钟。
 
+### 16.4 绝对不能随意调节jvm和thread pool的原因
+
+es中很多配置参数保持默认就可以，随意调节反而可能导致性能下降。
+
+#### jvm gc
+
+jvm使用垃圾回收器来释放掉不用的内存，千万不要去调节默认的垃圾回收行为。es默认用的垃圾回收器是CMS。
+CMS回收器是并发式的回收器，能够跟应用程序工作线程并发工作，最大程度减少垃圾回收时的服务停顿时间。
+但是CMS还是会有两个停顿阶段，同时在回收特别大的heap时也会有一些问题。
+尽管有一些缺点，但是CMS对于要求低延时请求响应的软件来说，还是最佳的垃圾回收器，因此官方的推荐就是使用CMS垃圾回收器。
+
+有一种最新的垃圾回收器叫做G1。G1回收器可以比CMS提供更少的回收停顿时间，而且能够这对大heap有更好的回收表现。
+它会将heap划分为多个region，然后自动预测哪个region会有最多可以回收的空间。通过回收那些region，就可以最小化停顿时长，而且可以针对大heap进行回收。
+听起来还挺不错的，但是不幸的是，G1还是比较年轻的一种垃圾回收器，而且经常会发现一些新的bug，这些bug可能会导致jvm挂掉。
+lucene的测试套件就检查出来了G1的一些bug。因此es官方不推荐现在使用G1垃圾回收器，也许在不久的未来，等G1更加稳定的时候，可以使用G1。
+
+#### thread pool
+
+每个人都很喜欢去调优线程池，而且大部分人都特别喜欢增加线程池的线程数量，无论是大量的写入，还是大量的搜索，或者是感觉服务器的cpu idle空闲率太高，都会增加更多的线程。
+在es中，默认的thread pool设置是非常合理的，对于所有的thread pool，除了搜索的线程池，都是线程数量设置的跟cpu core一样多的。
+如果我们有8个cpu core，那么就可以并行运行8个线程。那么对于大部分的线程池来说，分配8个线程就是最合理的数量。
+
+不过搜索会有一个更加大的thread pool，一般被配置为：cpu core * 3 / 2 + 1。
+
+也许我们会觉得有些线程可能会因为磁盘IO等操作block住，所以我们需要更多的线程。但是在es中这并不是一个问题，大多数的磁盘IO操作都是由lucene的线程管理的，而不是由es管理的，
+因此es的线程不需要关心这个问题。此外，thread pool还会通过在彼此之间传递任务来协作执行，我们不需要担心某一个网络线程会因为等待一次磁盘写操作，而导致自己被block住，无法处理网络请求。
+网络线程可以将那个磁盘写操作交给其他线程池去执行，然后自己接着回来处理网络请求。
+
+其实我们的进程的计算能力是有限的，分配更多的线程只会强迫cpu在多个线程上下文之间频繁来回切换。
+一个cpu core在同一时间只能运行一条线程，所以如果cpu要切换到另外一个线程去执行，需要将当前的state保存起来，然后加载其他的线程进来执行。
+如果线程上下文切换发生在一个cpu core内，那么还好一些，但是如果在多个cpu core之间发生线程上下文切换，那么还需要走一个cpu core内部的通信。
+这种线程上下文切换会消耗掉很多的cpu资源，对于现在的cpu来说，每次线程上下文切换，都会导致30微秒的时间开销，所以宁愿将这些时间花费在任务的处理上。
+
+### 16.5 jvm和服务器内存分配的最佳实践以及原理分析
+
+生产环境部署es其内存应该如何分配；比如现在一台机器上有64G的内存，或者32G的内存，那么一般来说应该分配多少个G的内存给es的jvm heap？
+
+#### jvm heap分配
+
+es默认会给jvm heap分配2个G的大小，对应生产环境可以根据机器配置进行调整；通过在jvm.options文件里面去设置jvm相关的参数，
+但是要注意-Xms和-Xmx最小和最大堆内存一定设置的一样，避免运行过程中的jvm heap resize，那会是一个非常耗时的过程。
+
+#### 将机器上少于一半的内存分配给es
+
+由于es是基于lucene进行封装的，而lucene的设计是要使用底层的os filesystem cache来缓存数据结构，因此会消耗大量的内存；因此不能将es的jvm heap size设置的过大；
+一般建议的是，将50%的内存分配给es jvm heap，然后留50%的内存给os cache。
+
+一个常见的问题就是将es进程的jvm heap size设置的过于大了。比如我们有一台64G的机器，可能我们甚至想要给es jvm size设置64G内存。
+但是这是错误的。大家可能会觉得说，直接将机器上的可用的内存都分配给es jvm heap，性能是绝对高的，因为大量的数据都可以缓存在内存里面。
+
+#### 不要给jvm分配超过32G内存
+
+不要将过多的内存分配给es的jvm heap；因为heap小于32G的的时候jvm会用一种技术来压缩对象的指针（object pointer）。
+在java中，所有的对象都会被分配到heap中，然后被一个pointer给引用。object pointer会指向heap中的对象，引用的是二进制格式的地址。
+
+对于32位的系统来说，jvm最大的heap size就是4G，解释一下：32位（0和1值），0和1在32位的组合是2^32次方的字节，除以1024就是多少k，再除以1024就是多少mb，再除以1024就是多少gb，最后算下来就是4G。
+对于64位的系统来说，heap size可以更大，但是64位的object pointer会耗费更多的空间，因为object pointer更大了。
+比浪费更多内存空间更恶劣的是，过大的object pointer会在cpu，main memory和LLC、L1等多级缓存间移动数据的时候，吃掉更多的带宽。
+
+所以jvm用了一种技术，叫做compressed oops来解决object pointer耗费过大空间的问题。这个技术的核心思想是，不要让object pointer引用内存中的二进制地址，
+而是让object pointer引用object offset。这就意味着32位的pointer可以引用400万个对象，而不是400万字节。这也意味着，使用32位的pointer，最大的heap大小可以到32G。
+此时只要heap size在32G以内，jvm就会自动启用32位的object pointer，因为32位的对象指针，足够引用32G的内存了，就可以用32位的pointer替代64位的pointer。但是32位的pointer比64位的pointer可以耗费更少的内存耗费。
+
+如果给jvm heap分配的内存小于32G，此时jvm会自动使用32位的object pointer，同时是让pointer指向对象的offset，32位的object pointer就足以引用32G的内存，
+同时32位的pointer占用的内存空间很少，对cpu和memory之间移动数据的带宽开销也很少。这个过程就叫做compressed oops。
+
+一旦越过32G这个界限，就是给jvm heap分配超过32G的内存，就没有办法用32位的pointer+引用object offset的模式了，
+因为32位的pointer最多引用32G的内存，超过了32G，就没法用32位pointer。不用32位pointer，就只能用64位pointer，才能引用超过32G的内存空间。
+此时pointer就会退回到传统的object pointer引用对象的二进制地址的模式，object pinter的大小会急剧增长，更多的cpu到内存的带宽会被占据，更多的内存被耗费。
+实际上，不用compressed oops时，如果给jvm heap分配一个40~50G的内存的可用空间，实际上object pointer可能都要占据十几G的内存空间，可用的空间量可能跟使用了compressed oops时的32GB内存的可用空间，20多个G，几乎是一样的。
+
+因此，即使我们有很多内存，但是还是要分配给heap在32GB以内，否则的话浪费更多的内存，降低cpu性能，而且会让jvm回收更大的heap。
+
+综上所述，如果给jvm heap分配超过32G的内存，实际上是没有什么意义的，因为用64位的pointer，1/3的内存都给object pointer给占据了，这段内存空间就浪费掉了。
+还不如分配32G以内，启用compressed oops，可用空间跟你分配50个G的内存，是一样的。
+
+因为32G的限制，如果es要处理的数据量上亿的话，几亿，或者十亿以内的规模，建议用64G的内存的机器比较合适，有个5台机器差不多就足够了。给jvm heap分配32G，留下32G给os cache。
+
+#### 在32G以内的具体应该设置heap为多大？
+
+根据具体情况而定的，不是固定死的，根据不同的操作系统以及jvm版本而定。一般而言，将jvm heap size设置小于等于31G比较安全一些。
+主要是要确保设置的这个jvm heap大小，可以让es启用compressed oops这种优化机制。此外，可以给jvm option加入-XX:+PrintFlagsFinal，然后可以打印出来UseCompressedOops是否为true。
+可以通过这种方式找到最佳的内存设置。可以不断调节内存大小，然后观察是否启用compressed oops。
+
+在es启动日志中，可以查看compressed oops是否开启，如下面的字样：
+
+    [2015-12-16 13:53:33,417][INFO ][env] [Illyana Rasputin] heap size [989.8mb], compressed ordinary object pointers [true]。
+
+#### 对于有1TB内存的超大内存机器该如何分配？
+
+如果部署机器是一台超级服务器，内存资源甚至达到了1TB，或者512G，128G，该怎么办？首先es官方是建议避免用这种超级服务器来部署es集群的，
+但是如果只有这种机器可以用的话，要考虑以下几点：
+
+* （1）我们是否在做大量的全文检索？考虑一下分配4~32G的内存给es进程，同时给lucene留下其余所有的内存用来做os filesystem cache。
+所有的剩余的内存都会用来cache segment file，而且可以提供非常高性能的搜索，几乎所有的数据都是可以在内存中缓存的，es集群的性能会非常高
+
+* （2）是否在做大量的排序或者聚合操作？聚合操作是不是针对数字、日期或者未分词的string？如果是的，那么还是给es 4~32G的内存即可，
+其他的留给es filesystem cache，可以将聚合好用的正排索引，doc values放在os cache中
+
+* （3）如果在针对分词的string做大量的排序或聚合操作？如果是，那么就需要使用field data，这就得给jvm heap分配更大的内存空间。
+此时不建议运行一个节点在机器上，而是运行多个节点在一台机器上，那么如果我们的服务器有128G的内存，可以运行两个es节点，然后每个节点分配32G的内存，
+剩下64G留给os cache。如果在一台机器上运行多个es node，建议设置：cluster.routing.allocation.same_shard.host: true。这会避免在同一台物理机上分配一个primary shard和它的replica shard。
+
+#### swapping
+
+如果频繁的将es进程的内存swap到磁盘上，绝对会是一个服务器的性能杀手。想象一下，内存中的操作都是要求快速完成的，如果需要将内存页的数据从磁盘swap回main memory，性能会有多差。
+如果内存被swap到了磁盘，那么100微秒的操作会瞬间变成10毫秒，那么如果是大量的这种内存操作呢？这会导致性能急剧下降。
+
+因此通常建议彻底关闭机器上的swap，swapoff -a，如果要永久性关闭，需要在/etc/fstab中配置
+
+如果没法完全关闭swap，那么可以尝试调低swappiness，这个值是控制os会如何将内存swap到磁盘的。这会在正常情况下阻止swap，但是在紧急情况下，还是会swap。
+一般用sysctl来设置，vm.swappiness = 1。如果swappiness也不能设置，那么就需要启用mlockall，这就可以让我们的jvm lock住自己的内存不被swap到磁盘上去，
+在elasticsearch.yml中可以设置：bootstrap.mlockall: true。
+
+#### 重要的操作系统设置（swapping、virutal memory等）
+
+##### 1、系统的重要配置
+
+理想情况下，es应该单独在一个服务器上运行，能够使用服务器上的所有资源。为了达到上述目标，需要配置操作系统，来允许用户运行es并且获取比默认情况下更多的资源。
+
+在生产环境中下面的一些设置必须配置一下：
+
+* （1）禁止swapping
+* （2）确保拥有足够的虚拟内存
+* （3）确保拥有足够的线程数量
+
+默认情况下，es会假设你是在开发模式下运行的。如果上面的任何配置没有正确的设置，那么会输出一些warning到日志文件中，但是还是可以启动es进程的。
+但是如果配置了网络设置，比如network.host，es会认为是运行在生产环境中的，然后就会将上述warning升级为exception。
+这些exception会阻止es节点启动。这是一个重要的安全保障措施来确保不会因为错误的配置了es server，而导致数据丢失。
+
+##### 2、配置系统设置
+
+在/etc/security/limits.conf中，可以配置系统设置；也可以用ulimit临时配置系统设置。
+在linux操作系统中，ulimit可以用来临时的改变资源限制。通常需要用root权限来设置ulimit。
+
+如果要设置file descriptor为65536，可以用如下的命令来设置：
+
+    ulimit -n 65536
+
+但是在linux操作系统中，实际上永久性的资源限制可以通过编辑/etc/security/limits.conf文件来设置。比如要设置file descriptor，可以再limits.conf中加入下面的行：
+
+    elasticsearch - nofile 65536
+
+在下一次elasticsearch用户开启一个新的会话时就会生效
+
+一般建议通过jvm.options配置文件来设置es的jvm option。默认的地址是config/jvm.options；每行是一个jvm argument。
+此外，如也可以通过ES_JAVA_OPTS环境变量来设置jvm option，比如下面的命令：
+
+    export ES_JAVA_OPTS="$ES_JAVA_OPTS -Djava.io.tmpdir=/path/to/temp/dir"
+
+##### 3、禁止swapping
+
+大多数操作系统都会使用尽量多的内存来进行file system cache，并且尽量将不经常使用的java应用的内存swap到磁盘中去。
+这会导致jvm heap的部分内存，甚至是用来执行代码的内存页被swap到磁盘中去。
+
+swapping对于性能来说是非常差劲的，为了es节点的稳定性考虑，应该尽量避免这种swapping。
+因为swapping会导致gc过程从毫秒级变成分钟级，在gc的时候需要将内存从磁盘中swapping到内存里，特别耗时，这会导致es节点响应请求变得很慢，甚至导致es node跟cluster失联。
+在一个弹性的分布式系统中，让操作系统kill掉某一个节点，是很高效的。
+
+有三种方法可以disable swapping。推荐的option是彻底禁用swap，如果做不到的化，也得尽量最小化swappiness的影响，比如通过lock memory的方法。
+
+* （1）禁用所有的swapping file；通常来说，es进程会在一个节点上单独运行，那么es进程的内存使用是由jvm option控制的。可以使用下面的命令临时性禁止`swap：swapoff -a`。
+要永久性的禁止swap，需要修改/etc/fstab文件，然后将所有包含swap的行都注释掉。
+* （2）配置swappiness；另外一个方法就是通过sysctl，将vm.swappiness设置为1，这可以尽量减少linux内核swap的倾向，在正常情况下，就不会进行swap，但是在紧急情况下，还是会进行swap操作。`sysctl -w vm.swappiness=1`
+* （3）启用bootstrap.memory_lock；最后一个选项，就是用mlockall，将es jvm进程的address space锁定在内存中，阻止es内存被swap out到磁盘上去。在config/elasticsearch.yml中，可以配置：`bootstrap.memory_lock: true`
+
+`GET _nodes?filter_path=**.mlockall`，通过这行命令可以检查mlockall是否开启了；如果发现mlockall是false，那么意味着mlockall请求失败了。会看到一行日志，unable to lock jvm memory。
+最大可能的原因，就是在linux系统中，启动es进程的用户没有权限去lock memory，需要通过以下方式进行授权：
+
+    ulimit -l unlimited
+
+    /etc/security/limits.conf，memlock设置为unlimited
+
+另外一个原因可能是临时目录使用noexec option来mount了。可以通过指定一个新的临时目录来解决
+
+    export ES_JAVA_OPTS="$ES_JAVA_OPTS -Djava.io.tmpdir=/path/to/temp/dir"
+
+当然也可以通过在jvm.options文件中来设置java.io.tmpdir
+
+##### 4、虚拟内存
+
+es使用hybrid mmapfs / niofs目录来存储index数据，操作系统的默认mmap count限制是很低的，可能会导致内存耗尽的异常。
+需要提升mmap count的限制：`sysctl -w vm.max_map_count=262144`；
+如果要永久性设置这个值，要修改/etc/sysctl.conf，将vm.max_map_count的值修改一下，重启过后，用sysctl vm.max_map_count来验证一下数值是否修改成功
+
+es同时会用NioFS和MMapFS来处理不同的文件，需要设置最大的map，这样才能有足够的虚拟内存来给mmapped文件使用，可以用sysctl来设置：`sysctl -w vm.max_map_count=262144`。
+还可以再/etc/sysctl.conf中，对vm.max_map_count来设置。
+
+##### 5、设置线程的数量
+
+es用了很多线程池来应对不同类型的操作，在需要的时候创建新的线程是很重要的。要确保es用户能创建的最大线程数量至少在2048以上。
+可以通过ulimit -u 2048来临时设置，也可以在/etc/security/limits.conf中设置nproc为2048来永久性设置。
+
+### 16.6 production mode下启动时的bootstrap check
+
+#### 1、bootstrap check
+
+经常会碰到一些es的用户，遇到一些奇怪的问题，主要是因为他们没有配置一些重要的设置。在es以前的老版本中，对这些设置错误的配置，会在日志里记录一些warning告警。
+但是有时候用户会忽略这些日志中的告警信息。为了确保这些错误配置告警信息可以引起用户的注意，es的新版本中引入了bootstrap check，也就是启动时检查。
+这些启动时检查操作，会检查许多es和系统的设置，将这些配置的值跟es期望的安全值去进行比较。如果es在development mode下，那么失败的检查仅仅在日志中打印warning。如果es运行在生产模式下，任何启动时检查的失败都会导致es拒绝启动。
+
+#### 2、development mode vs. production mode
+
+默认情况下，es绑定到localhost hostname，来进行http和内部通信。这对于下载es并简单试用一下，包括日常的开发，都是非常方便的，但是对于生产环境是不行的。
+如果要组件一个es集群，es实例必须能够通过内部通信协议互相连通，所必须绑定通信到一个外部的接口上。因此如果一个es实例没有绑定通信到外部接口（默认情况下），那么就认为es是处于开发模式下。反之，如果绑定通信到外部接口，那么就是处于生产模式下。
+可以通过http.host和transport.host，单独配置http的传输。这就可以配置一个es实例通过http可达，但是却不触发生产模式。
+
+因为有时用户需要将通信绑定到外部解耦来测试client的调用。对于这种场景，es提供了single-node恢复模式（将discovery.type设置为single-node），配置过后，一个节点会选举自己作为master，而且不会跟其他任何节点组成集群。
+
+如果在生产模式下运行一个single node实例，就可以规避掉启动时检查（不要将通信绑定到外部接口，或者将通信绑定到外部接口，但是设置discovery type为single-node）。
+在这种场景下，可以设置es.enforce.bootstrap.checks为true（通过jvm参数来设置），来强制bootstrap check的执行。
+
+#### 3、heap size check
+
+如果jvm启动的时候设置的初始队大小和最大堆大小不同，可能会导致es运行期间的暂停，因为jvm堆在系统运行期间可能会改变大小。为了避免这种jvm resize导致的es进程暂停，建议启动jvm时，将初始堆大小和最大堆大小设置的相等。
+除此之外，如果bootstrap.memory_lock被启用了，jvm会在启动期间锁定jvm的初始大小。
+
+如果要通过heap size check，就必须合理设置heap size。默认情况下，es的jvm堆的最小和最大大小都是2g。
+如果在生产环境中使用，应该配置合理的heap size确保es有足够的堆内存可以使用。在jvm.options中设置的Xms和Xmx会用来分配jvm堆内存带澳。
+这些设置的值依赖于服务器上可用的总内存大小。下面是一些最佳实践的建议：
+
+* （1）将heap的最小和最大大小设置为一样大；
+* （2）es有更多的heap大小，就有更多的内存用来进行缓存，但是过大的jvm heap可能会导致长时间的gc停顿；
+* （3）不要设置最大heap size超过物理内存的50%，这样才能给核心的file system cache留下足够的内存；
+* （4）不要将Xmx设置超过32GB，否则jvm无法启用compressed oops，将对象指针进行压缩，确认日志里有`heap size [1.9gb], compressed ordinary object pointers [true]`
+* （5）更好的选择是，heap size设置的小于zero-based compressed ooops，也就是26GB，但是有时也可以是30GB。
+通过`-XX:+UnlockDiagnosticVMOptions -XX:+PrintCompressedOopsMode`开启对应，确认有`heap address: 0x000000011be00000, size: 27648 MB, zero based Compressed Oops`，而不是`heap address: 0x0000000118400000, size: 28672 MB, Compressed Oops with base: 0x00000001183ff000`
+* （6）在jvm.options文件中，可以通过如下方式来配置heap size
+
+
+        -Xms2g 
+        -Xmx2g
+
+* （7）也可以通过ES_JAVA_OPTS环境变量来设置heap size
+
+
+        ES_JAVA_OPTS="-Xms2g -Xmx2g"
+
+#### 4、file descriptor check
+
+file descriptor是unix操作系统的一种数据结构，用来track打开的文件。在unix操作系统中，所有东西都是file。
+比如，file可以是物理文件，虚拟文件，或者网络socket。es需要大量的file descriptor，比如每个shard都由多个segment和其他文件组成，还有跟其他节点之间的网络通信连接。
+
+因为es要使用大量的file descriptor，所以如果file descriptor耗尽的话，会是一场灾难，甚至可能会导致数据丢失。尽量给es的file descriptor提升到65536，甚至更高。
+可以在/etc/security/limits.conf中，设置nofile为65536。
+
+    GET _nodes/stats/process?filter_path=**.max_file_descriptors
+
+可以用上面这行代码检查每个node上的file descriptor数量。
+
+lucene会使用大量的文件，同时es也会使用大量的socket在节点间和client间进行通信，这些都是需要大量的file descriptor的。但是通常来说，现在的linux操作系统，都是给每个进程默认的1024个file descriptor的，这对于一个es进程来说是远远不够的。
+因此需要将es进程的file descriptor增加到非常非常大，比如说65535个。一般需要根据我们的操作系统的文档来查看如何设置file descriptor。然后可以直接对es集群查看GET，来确认file descriptor的数量：
+
+#### 5、memory lock check
+
+如果jvm进行一个major gc的话，那么就会涉及到heap中的每一个内存页，此时如果任何一个内存页被swap到了磁盘上，那么此时就会被swap回内存中。
+这就会导致很多的磁盘读写开销，而这些磁盘读写开销如果节省下来，可以让es服务更多的请求。有很多方法可以配置系统禁止swap。其中一种方法就是让jvm去lock heap内存在物理内存中，设置bootstrap.memory_lock即可。
+
+    GET _nodes?filter_path=**.mlockall
+
+检查一下，mlockall是否开启，如果是false，那么说明lock memory失败了，而且日志里可能会有`unable to lock jvm memory`的字样。
+
+可能就是因为运行es的用户没有lock memory的权限，此时就需要进行授权
+
+    /etc/security/limits.conf
+
+设置memlock为unlimited即可完成授权
+
+另外一个原因导致lock memory失败，可能是因为临时目录，/tmp用noexec option来mount了。那么就需要设置`ES_JAVA_OPTS，export ES_JAVA_OPTS="$ES_JAVA_OPTS -Djava.io.tmpdir=/path/to/temp/dir"`或者在jvm.options中设置这个参数
+
+#### 6、maximum number of thread check
+
+es会将每个请求拆分成多个stage，然后将stage分配到不同线程池中去执行。在es中有多个线程池来执行不同的任务。所以es会创建许多的线程。最大线程数量的检查会确保，es实例有权限去创建足够的线程。
+如果要通过这个检查，必须允许es进程能够创建超过2048个线程。`/etc/security/limits.conf`在这个文件中用nproc来设置
+
+#### 7、maximum size virtual memory check
+
+es使用mmap来将索引映射到es的address space中，这可以让jvm heap外但是内存中的索引数据，可以有非常快的读写速度。因此es需要拥有unlimited address space。最大虚拟内存大小的检查，会要求es进程有unlimited address space。
+`/etc/security/limits.conf`，设置as为unlimited
+
+#### 8、maximum map count check
+
+要高效使用mmap的话，es同样要求创建许多memory-mapped area。因此要求linux内核允许进程拥有至少262144个memory-mapped area，需要通过sysctl设置vm.max_map_count至少超过262144。
+
+#### 9、client jvm check
+
+jvm有两种模式，client jvm和server jvm。不同的jvm会用不同的编译器来从java源码生成可执行机器代码。client jvm被优化了来减少startup time和内存占用，server jvm被优化了来最大化性能。
+两种jvm之间的性能区别是很明显的。client jvm check会确保es没有运行在client jvm下。必须使用server jvm模式来启动es，而server jvm是默认的。
+
+#### 10、use serial collector check
+
+针对不同工作负载，jvm提供了不同的垃圾回收器。串行化垃圾回收期对于单cpu机器或者小内存，是很有效的。
+但是对于es来说，用串行化垃圾回收器，会成为一场性能上的灾难。因此这个check会确保es没有被配置使用串行化垃圾回收器。es默认的就是cms垃圾回收器。
+
+#### 11、system call filter check
+
+es会根据不同的操作系统来安装system call filter，用来阻止执行作为defense机制的fork相关system call，进而避免任意代码执行的攻击。
+这个check会检查是否允许system call filter，然后安装这些system call filter。避免bootstrap.system_call_filter设置为false。
+
+#### 12、OnError and OnOutOfMemoryError check
+
+jvm参数，OnError和OnOutOfMemoryError允许在jvm遇到了fatal error或者是OutOfMemoryErro的时候，执行我们预定义的命令。
+然而，默认情况下，es system call filter是启用的，这些filter是阻止forking操作的。因此，用OnError和OnOutOfMemroyError和system call filter是不兼容的。
+这个check会检查，如果启用了system call filter，还设置了这两个jvm option，那么就不能启动。所以不要在jvm option中设置这两个参数。
+
+#### 13、early-access check
+
+jdk提供了early-access快照，为即将到来的版本。这些版本不适合用作生产环境。这个check会检查有没有使用jdk的early-access快照版本。我们应该用jdk稳定版本，而不是试用版本。
+
+#### 14、G1 GC check
+
+jdk 8的jvm早期版本中的g1 gc，有已知的问题可能导致索引破损。在JDK 8u40之前的版本都有这个问题。这个check会检查是否使用了那种早期的JDk版本。
+
+### 16.7 各个节点以daemon模式运行以及优雅关闭
+
+#### 1、以daemon模式运行
+
+在生产环境中，会使用daemon进程的方式来启动es，而不是直接采用前台进程的方式来启动es，具体命令如下
+
+    ./bin/elasticsearch -d -p pid
+
+上面命令中的-d option用来指定es以daemon进程方式启动，并且-p option指定将进程id记录在指定文件中。es启动后，日志信息可以在ES_HOME/logs目录中查看。
+此外，启动es进程的时候，还可以直接覆盖一些配置，使用-E即可，如下面的命令，通常用于调试集群参数时，方便快速调节参数，查看效果。
+
+* （1）log4j的配置不能有空格
+* （2）创建专门运行elasticsearch的用户，并授权；es其实是禁止用root用户去启动es进程的，那么可以加一个配置来允许用root去启动，但是不建议这样做。
+
+
+    adduser elasticsearch
+    passwd elasticsearch
+
+    chown -R elasticsearch /usr/local/elasticsearch
+    chown -R elasticsearch /var/log/elasticsearch
+    chown -R elasticsearch /var/data/elasticsearch
+    chown -R elasticsearch /var/plugin/elasticsearch
+    chown -R elasticsearch /etc/elasticsearch
+    chown -R elasticsearch /usr/local/tmp
+
+* （3）修改/etc/security/limits.conf中的用户为elasticsearch，而不是root
+* （4）加入memlock的soft unlimited
+* （5）path.plugins失效，删除这一行配置
+* （6）jvm.options看来还是用的老的目录中的配置文件
+* （7）将es的bin加入环境变量PATH中
+* （8）切换到elasticsearch用户来启动es进程：`su elasticsearch` `elasticsearch -d -Epath.conf=/etc/elasticsearch`
+
+#### 2、访问es
+
+一般建议在管理机上安装一个curl工具，可以手工发送rest api请求
+可以对启动了es的节点的9200端口，发送一个GET /请求，可以看看es是否启动成功
+
+    curl -XGET elasticsearch02:9200
+    curl -XGET elasticsearch02:9200/_cat/nodes?v
+
+#### 3、停止es
+
+优雅的关闭es，可以确保es关闭的很干净，并且优雅关闭资源。举例来说，如果node在一个合理的顺序下关闭了，首先会将自己从cluster中优雅移除，fsync translog日志到磁盘中去，然后执行其他相关的cleanup活动。
+如果我们将es用service的方式来运行，那么可以通过server管理功能来停止es。如果我们是直接启动es的，可以control-C停止es，或者是发送SEGTERM信号给es进程
+
+    jps | grep Elasticsearch
+    kill -SIGTERM 15516
+
+如果es发生了fatal error，类似out of memory error，代码bug，或者io error，等等。
+当es发现jvm有一个fatal error，就会尝试记录在log里面，然后尝试去停止jvm。此时es是不会按照优雅关闭的模式去执行的，而是会直接关闭，并且返回一个错误码
+
+    JVM internal error 					128
+    Out of memory error 				127
+    Stack overflow error 				126
+    Unknown virtual machine error 		125
+    Serious I/O error 					124
+    Unknown fatal error 				1
+
+### 16.8 生产集群备份恢复之部署hadoop hdfs分布式文件存储系统
+
+* hadoop是当前大数据领域的事实上的一个标准
+* hadoop hdfs，提供的是分布式的文件存储，数据存储
+* hadoop yarn，提供的是分布式的资源调度
+* hadoop mapreduce，提供的是分布式的计算引擎，跑在yarn上面的，由yarn去做资源调度
+* hadoop hive，提供的是分布式的数据仓库引擎，基于mapreduce
+* hadoop hbase，提供的是分布式的NoSQL数据库，基于hdfs去做的
+
+使用hadoop hdfs做文档存储
+
+### 16.9 es生产集群备份恢复之基于snapshot+hdfs进行数据备份
+
+#### 1、es集群数据备份
+
+任何一个存储数据的软件，都需要定期的备份数据。es replica提供了运行时的高可用保障机制，可以容忍少数的节点故障和部分数据的丢失，但是整体上却不会丢失任何数据，而且不会影响集群运行。
+但是replica没法进行灾难性的数据保护，比如说机房彻底停电，所有机器全部当即，等等情况。对于这种灾难性的故障，我们就需要对集群中的数据进行备份了，集群中数据的完整备份。
+
+要备份集群数据，就要使用snapshot api。这个api会将集群当前的状态和数据全部存储到一个外部的共享目录中去，比如NAS，或者hdfs。而且备份过程是非常智能的，第一次会备份全量的数据，但是接下来的snapshot就是备份两次snapshot之间的增量数据了。
+数据是增量进入es集群或者从es中删除的，那么每次做snapshot备份的时候，也会自动在snapshot备份中增量增加数据或者删除部分数据。因此这就意味着每次增量备份的速度都是非常快的。
+
+如果要使用这个功能，我们需要有一个预先准备好的独立于es之外的共享目录，用来保存我们的snapshot备份数据。es支持多种不同的目录类型：shared filesystem，比如NAS；Amazon S3；hdfs；Azure Cloud。
+不过对于国内的情况而言，其实NAS应该很少用，一般来说，就用hdfs会比较多一些，跟hadoop这种离线大数据技术栈整合起来使用。
+
+#### 2、创建备份仓库
+
+* （1）创建和查询仓库的命令
+
+
+    PUT _snapshot/my_backup 
+    {
+        "type": "fs", 
+        "settings": {
+            "location": "/mount/backups/my_backup" 
+        }
+    }
+
+这里用了shared filesystem作为仓库类型，包括了仓库名称以及仓库类型是fs，还有仓库的地址。这个里面就包含了仓库的一些必要的元数据了。
+可能还有其他的一些参数可以配置，主要是基于我们的node和网络的性能来配置。max_snapshot_bytes_per_sec，这个参数用于指定数据从es灌入仓库的时候，进行限流，默认是20mb/s。
+max_restore_bytes_per_sec，这个参数用于指定数据从仓库中恢复到es的时候，进行限流，默认也是20mb/s。假如说网络是非常快速的，那么可以提高这两个参数的值，可以加快每次备份和恢复的速度，比如下面：
+
+    POST _snapshot/my_backup/ 
+    {
+        "type": "fs",
+        "settings": {
+            "location": "/mount/backups/my_backup",
+            "max_snapshot_bytes_per_sec" : "50mb", 
+            "max_restore_bytes_per_sec" : "50mb"
+        }
+    }
+
+创建一个仓库之后，就可以查看这个仓库的信息了：`GET /_snapshot/my_backup`，或者是查看所有的仓库，`GET /_snapshot/_all`。可能返回如下的信息：
+
+    {
+      "my_backup": {
+        "type": "fs",
+        "settings": {
+          "compress": true,
+          "location": "/mount/backups/my_backup"
+        }
+      }
+    }
+
+* （2）基于hdfs创建仓库
+
+但是其实如果在国内使用es的话，还是建议跟hadoop生态整合使用，不要用那种shared filesystem。可以用hadoop生态的hdfs分布式文件存储系统。
+首先先要安装repository-hdfs的插件：bin/elasticsearch-plugin install repository-hdfs，必须在每个节点上都安装，然后重启整个集群。
+
+    kill -SIGTERM 15516
+
+    su elasticsearch
+    elasticsearch -d -Epath.conf=/etc/elasticsearch
+    
+    curl -XGET elasticsearch02:9200/_cat/nodes?v
+
+在3个hdfs node上，都加入hdfs-site.xml，禁止权限检查，如果要修改这个配置文件，要先在/usr/local/hadoop/sbin，运行./stop-dfs.sh，停止整个hdfs集群，然后在3个node上，都修改hdfs-site.xml，加入下面的配置，禁止权限的检查
+
+    <property>
+      <name>dfs.permissions</name>
+      <value>false</value>
+    </property>
+
+hdfs snapshot/restore plugin是跟最新的hadoop 2.x整合起来使用的，目前是hadoop 2.7.1。所以如果我们使用的hadoop版本跟这个es hdfs plugin的版本不兼容，那么考虑在hdfs plugin的文件夹里，
+将hadoop相关jar包都替换成我们自己的hadoop版本对应的jar包。即使hadoop已经在es所在机器上也安装了，但是为了安全考虑，还是应该将hadoop jar包放在hdfs plugin的目录中。
+
+安装好了hdfs plugin之后，就可以创建hdfs仓库了，用如下的命令即可：
+
+    curl -XGET 'http://localhost:9200/_count?pretty' -d '
+    {
+        "query": {
+            "match_all": {}
+        }
+    }
+    '
+
+    curl -XPUT 'http://elasticsearch02:9200/_snapshot/my_hdfs_repository2' -d '
+    {
+      "type": "hdfs",
+      "settings": {
+        "uri": "hdfs://elasticsearch02:9000/",
+        "path": "elasticsearch/respositories/my_hdfs_repository",
+        "conf.dfs.client.read.shortcircuit": "false",
+        "max_snapshot_bytes_per_sec" : "50mb", 
+        "max_restore_bytes_per_sec" : "50mb"
+      }
+    }'
+
+* （3）验证仓库
+
+如果一个仓库被创建好之后，我们可以立即去验证一下这个仓库是否可以在所有节点上正常使用。verify参数都可以用来做这个事情，比如下面的命令。这个命令会返回一个node列表，证明那些node都验证过了这个仓库是ok的，可以使用的
+
+    curl -XPOST 'http://elasticsearch02:9200/_snapshot/my_hdfs_repository/_verify'
+
+先停止整个es集群，然后在3个节点上，都加入下面的配置，然后用elasticsearch账号重启整个es集群
+
+    /usr/local/elasticsearch/plugins/repository-hdfs/plugin-security.policy
+
+      permission java.lang.RuntimePermission "accessDeclaredMembers";
+      permission java.lang.RuntimePermission "getClassLoader";
+      permission java.lang.RuntimePermission "shutdownHooks";
+      permission java.lang.reflect.ReflectPermission "suppressAccessChecks";
+      permission javax.security.auth.AuthPermission "doAs";
+      permission javax.security.auth.AuthPermission "getSubject";
+      permission javax.security.auth.AuthPermission "modifyPrivateCredentials";
+      permission java.security.AllPermission;
+      permission java.util.PropertyPermission "*", "read,write";
+      permission javax.security.auth.PrivateCredentialPermission "org.apache.hadoop.security.Credentials * \"*\"", "read";
+  
+    /usr/local/elasticsearch/config/jvm.options  
+    
+    -Djava.security.policy=file:////usr/local/elasticsearch/plugins/repository-hdfs/plugin-security.policy
+
+#### 3、对索引进行snapshotting备份
+
+* （1）对所有open的索引进行snapshotting备份
+
+一个仓库可以包含多分snapshot，每个snapshot是一部分索引的备份数据，创建一份snapshot备份时，我们要指定要备份的索引。比如下面这行命令：PUT _snapshot/my_hdfs_repository/snapshot_1，这行命令就会将所有open的索引都放入一个叫做snapshot_1的备份，并且放入my_backup仓库中。这个命令会立即返回，然后备份操作会被后台继续进行。如果我们不希望备份操作以后台方式运行，而是希望在前台发送请求时等待备份操作执行完成，那么可以加一个参数即可，比如下面这样：PUT _snapshot/my_backup/snapshot_1?wait_for_completion=true。
+
+    curl -XPUT 'http://elasticsearch02:9200/_snapshot/my_hdfs_repository/snapshot_1'
+
+* （2）对指定的索引进行snapshotting备份
+
+默认的备份是会备份所有的索引，但是有的时候，可能我们不希望备份所有的索引，有些可能是不重要的数据，而且量很大，没有必要占用我们的hdfs磁盘资源，那么可以指定备份少数重要的数据即可。此时可以使用下面的命令去备份指定的索引：
+
+    PUT _snapshot/my_backup/snapshot_2
+    {
+        "indices": "index_1,index_2",
+        "ignore_unavailable": true,
+        "include_global_state": false,
+        "partial": true
+    }
+
+ignore_unavailable如果设置为true的话，那么那些不存在的index就会被忽略掉，不会进行备份过程中。默认情况下，这个参数是不设置的，那么此时如果某个index丢失了，会导致备份过程失败。
+设置include_global_state为false，可以阻止cluster的全局state也作为snapshot的一部分被备份。默认情况下，如果某个索引的部分primary shard不可用，那么会导致备份过程失败，那么此时可以将partial设置为true。
+
+而且snapshotting的过程是增量进行的，每次执行snapshotting的时候，es会分析已经存在于仓库中的snapshot对应的index file，然后仅仅备份那些自从上次snapshot之后新创建的或者有过修改的index files。
+这就允许多个snapshot在仓库中可以用一种紧凑的模式来存储。而且snapshotting过程是不会阻塞所有的es读写操作的，然而，在snapshotting开始之后，写入index中的数据，是不会反应到这次snapshot中的。
+每次snapshot除了创建一份index的副本之外，还可以保存全局的cluster元数据，里面包含了全局的cluster设置和template。
+
+每次只能执行一次snapshot操作，如果某个shard正在被snapshot备份，那么这个shard此时就不能被移动到其他node上去，这会影响shard rebalance的操作。只有在snapshot结束之后，这个shard才能够被移动到其他的node上去。
+
+#### 4、查看snapshot备份列表
+
+一旦我们在仓库中备份了一些snapshot之后，就可以查看这些snapshot相关的详细信息了，使用这行命令就可以查看指定的snapshot的详细信息：GET _snapshot/my_backup/snapshot_2，结果大致如下所示。
+当然也可以查看所有的snapshot列表，GET _snapshot/my_backup/_all。
+
+    curl -XGET 'http://elasticsearch02:9200/_snapshot/my_hdfs_repository/snapshot_1?pretty'
+
+    {
+      "snapshots" : [
+        {
+          "snapshot" : "snapshot_1",
+          "uuid" : "x8DXcrp2S0md-BC9ftYZqw",
+          "version_id" : 5050099,
+          "version" : "5.5.0",
+          "indices" : [
+            "my_index"
+          ],
+          "state" : "SUCCESS",
+          "start_time" : "2017-07-08T19:54:54.914Z",
+          "start_time_in_millis" : 1499543694914,
+          "end_time" : "2017-07-08T19:54:56.886Z",
+          "end_time_in_millis" : 1499543696886,
+          "duration_in_millis" : 1972,
+          "failures" : [ ],
+          "shards" : {
+            "total" : 5,
+            "failed" : 0,
+            "successful" : 5
+          }
+        }
+      ]
+    }
+
+#### 5、删除snapshot备份
+
+如果要删除过于陈旧的snapshot备份快照，那么使用下面这行命令即可：DELETE _snapshot/my_backup/snapshot_2。记住，一定要用api去删除snapshot，不要自己手动跑到hdfs里删除这个数据。
+因为snapshot是增量的，有可能很多snapshot依赖于底层的某一个公共的旧的snapshot segment。但是delete api是理解数据如何增量存储和互相依赖的，所以可以正确的删除那些不用的数据。
+如果我们自己手工进行hdfs文件删除，可能导致我们的backup数据破损掉，就无法使用了。
+
+    curl -XDELETE 'http://elasticsearch02:9200/_snapshot/my_hdfs_repository/snapshot_1'
+
+#### 6、监控snapshotting的进度
+
+使用wait_for_completion可以在前台等待备份完成，但是实际上也没什么必要，因为可能要备份的数据量特别大，难道还等待1个小时？
+看着是不太现实的，所以一般还是在后台运行备份过程，然后使用另外一个监控api来查看备份的进度，首先可以获取一个snapshot ID：GET _snapshot/my_backup/snapshot_3。
+如果这个snapshot还在备份过程中，此时我们就可以看到一些信息，比如什么时候开始备份的，已经运行了多长时间，等等。然而，这个api用了跟snapshot一样的线程池去执行，如果我们在备份非常大的shard，进度的更新可能会非常之慢。
+一个更好的选择是用_status API，GET _snapshot/my_backup/snapshot_3/_status，这个api立即返回最详细的数据。这里我们可以看到总共有几个shard在备份，已经完成了几个，还剩下几个，包括每个索引的shard的备份进度：
+
+    curl -XGET 'http://elasticsearch02:9200/_snapshot/my_hdfs_repository/snapshot_1'
+
+#### 7、取消snapshotting备份过程
+
+如果想要取消一个正在执行的snapshotting备份过程，比如发现备份时间过于长，希望先取消然后在晚上再运行，或者是因为不小心误操作发起了一次备份操作，这个时候就可以运行下面这条命令：DELETE _snapshot/my_backup/snapshot_3。
+也就是立即删除这个snapshot，这个命令会去取消snapshot的过程，同时将备份了一半的仓库中的数据给删除掉。
+
+    curl -XDELETE 'http://elasticsearch02:9200/_snapshot/my_hdfs_repository/snapshot_1'
+
+### 16.10 生产集群备份恢复之基于snapshot+hdfs+restore进行数据恢复
+
+#### 1、基于snapshot的数据恢复
+
+正经备份，一般来说，是在一个shell脚本里，用crontab做一个定时，比如每天凌晨1点，就将所有的数据做一次增量备份，当然，如果数据量较大，每小时做一次也ok。shell脚本里，就用curl命令，自动发送一个snapshot全量数据的请求。
+那么这样的话，就会自动不断的去做增量备份。
+
+两次snapshot是有关联关系的，因为第二次snapshot是基于第一次snapshot的数据，去做的增量备份。如果要做数据恢复，比如误删除，不小心将整个index给删除掉了，数据丢了，很简单，直接用最新的那个snapshot就可以了，比如snapshot_20170722。
+
+如果是做了一些错误的数据操作，举个例子，今天程序有个bug，写入es中的数据都是错误的，需要清洗数据，重新导入。
+这个时候，虽然最新的 snapshot_20200822，但是也可以手动选择 snapshot_20200821 snapshot，去做恢复，相当于是将数据恢复到20200821号的数据情况，忽略掉20200822号的数据的变更，然后重新去导入数据。
+
+如果用一些脚本定期备份数据之后，那么在es集群故障，导致数据丢失的时候，就可以用_restore api进行数据恢复了。比如下面这行命令：POST _snapshot/my_hdfs_repository/snapshot_1/_restore。
+这个时候，会将那个snapshot中的所有数据恢复到es中来，如果snapshot_1中包含了5个索引，那么这5个索引都会恢复到集群中来。不过我们也可以选择要从snapshot中恢复哪几个索引。
+我们还可以通过一些option来重命名索引，恢复索引的时候将其重命名为其他的名称。在某些场景下，比如我们想恢复一些数据但是不要覆盖现有数据，然后看一下具体情况，用下面的命令即可恢复数据，并且进行重命名操作：
+
+    POST /_snapshot/my_hdfs_repository/snapshot_1/_restore
+    {
+        "indices": "index_1", 
+        "ignore_unavailable": true,
+        "include_global_state": true,
+        "rename_pattern": "index_(.+)", 
+        "rename_replacement": "restored_index_$1" 
+    }
+
+这个restore过程也是在后台运行的，如果要在前台等待它运行完，那么可以加上wait_for_completion flag：POST _snapshot/my_backup/snapshot_1/_restore?wait_for_completion=true。
+restore过程只能针对已经close掉的index来执行，而且这个index的shard还必须跟snapshot中的index的shard数量是一致的。
+restore操作会自动在恢复好一个index之后open这个index，或者如果这些index不存在，那么就会自动创建这些index。如果通过include_global_state存储了集群的state，还会同时恢复一些template。
+默认情况下，如果某个索引在恢复的时候，没有在snapshot中拥有所有的shard的备份，那么恢复操作就会失败，比如某个shard恢复失败了。但是如果将partial设置为true，那么在上述情况下，就还是可以进行恢复操作得。
+不过在恢复之后，会自动重新创建足够数量的replica shard。此外，还可以在恢复的过程中，修改index的一些设置，比如下面的命令：
+
+    POST /_snapshot/my_backup/snapshot_1/_restore
+    {
+      "indices": "index_1",
+      "index_settings": {
+        "index.number_of_replicas": 0
+      },
+      "ignore_index_settings": [
+        "index.refresh_interval"
+      ]
+    }
+
+#### 2、监控restore的进度
+
+从一个仓库中恢复数据，其实内部机制跟从其他的node上恢复一个shard是一样的。如果要监控这个恢复的过程，可以用recovery api，比如：GET restored_index_3/_recovery。
+如果要看所有索引的恢复进度：GET /_recovery/。可以看到恢复进度的大致的百分比。结果大致如下所示：
+
+    curl -XGET 'http://elasticsearch02:9200/my_index/_recovery?pretty'
+
+#### 3、取消恢复过程
+
+如果要取消一个恢复过程，那么需要删除已经被恢复到es中的数据。因为一个恢复过程就只是一个shard恢复，发送一个delete操作删除那个索引即可，比如：DELETE /restored_index_3。
+如果那个索引正在被恢复，那么这个delete命令就会停止恢复过程，然后删除已经恢复的 所有数据。
+
+    curl -XDELETE 'http://elasticsearch02:9200/my_index'
+
+### 16.11 生产集群版本升级之基于节点依次重启策略进行各个小版本之间的升级
+
+生产集群的时候，版本升级，是不可避免的，如果去运维一个es的集群，要做各个版本之间的升级，该怎么做？三种策略：
+
+* 1、面向的场景，就是同一个大版本之间的各个小版本的升级，比如说，es 5.3升级到es 5.5
+* 2、相邻的两个大版本之间的升级，比如es 2.x升级到es 5.x，es 2.4.3，升级到es 5.5
+* 3、跨了几个大版本之间的升级，比如es 1.x升级到es 5.x
+
+每一种场景使用的技术方案都是不一样的
+
+#### 1、es版本升级的通用步骤
+
+* （1）看一下最新的版本的breaking changes文档，官网，看一下，每个小版本之间的升级，都有哪些变化，新功能，bugfix
+* （2）用elasticsearch migration plugin在升级之前检查以下潜在的问题（在老版本的时候可能还会去用，现在新版本这个plugin很少用了）
+* （3）在开发环境的机器中，先实验下版本升级，定一下升级的技术方案和操作步骤的文档，然后先在测试环境里，先升级一次，搞一下
+* （4）对数据做一次全量备份，备份和恢复，最次最次的情况，哪怕是升级失败了，哪怕是你重新搭建一套全新的es
+* （5）检查升级之后各个plugin是否跟es主版本兼容，升级完es之后，还要重新安装一下你的plugin
+
+es不同版本之间的升级，用的升级策略是不一样的，比如：
+
+* （1）es 1.x升级到es 5.x，是需要用索引重建策略的
+* （2）es 2.x升级到es 5.x，是需要用集群重启策略的
+* （3）es 5.x升级到es 5.y，是需要用节点依次重启策略的
+
+> es的每个大版本都可以读取上一个大版本创建的索引文件，但是如果是上上个大版本创建的索引，是不可以读取的。比如说es 5.x可以读取es 2.x创建的索引，但是没法读取es 1.x创建的索引。
+
+#### 2、rolling upgrade（节点依次重启策略）
+
+rolling upgrade会让es集群每次升级一个node，对于终端用户来说，是没有停机时间的。在一个es集群中运行多个版本，长时间的话是不行的，因为shard是没法从一较新版本的node上replicate到较旧版本的node上的。
+比如先部署一个es 5.3.2版本，将配置文件放在外部目录，同时将data和log目录都放在外部，然后插入一些数据，然后再开始下面的升级过程
+
+    adduser elasticsearch
+    passwd elasticsearch
+    
+    chown -R elasticsearch /usr/local/elasticsearch
+    chown -R elasticsearch /var/log/elasticsearch
+    chown -R elasticsearch /var/data/elasticsearch
+    chown -R elasticsearch /etc/elasticsearch
+
+    su elasticsearch
+    
+    elasticsearch -d -Epath.conf=/etc/elasticsearch
+
+    curl -XPUT 'http://localhost:9200/forum/article/1?pretty' -d '
+    {
+      "title": "first article",
+      "content": "this is my first article"
+    }'
+
+* （1）禁止shard allocation
+
+停止一个node之后，这个node上的shard全都不可用了，此时shard allocation机制会等待一分钟，然后开始shard recovery过程，也就是将丢失掉的primary shard的replica shard提升为primary shard，同时创建更多的replica shard满足副本数量，
+但是这个过程会导致大量的IO操作，是没有必要的。因此在开始升级一个node，以及关闭这个node之前，先禁止shard allocation机制：
+
+    curl -XPUT 'http://localhost:9200/_cluster/settings?pretty' -d '
+    {
+      "persistent": {
+        "cluster.routing.allocation.enable": "none"
+      }
+    }'
+
+* （2）停止非核心业务的写入操作，以及执行一次flush操作
+
+可以在升级期间继续写入数据，但是如果在升级期间一直写入数据的话，可能会导致重启节点的时候，shard recovery的时间变长，因为很多数据都是translog里面，没有flush到磁盘上去。
+如果我们暂时停止数据的写入，而且还进行一次flush操作，把数据都刷入磁盘中，这样在node重启的时候，几乎没有什么数据要从translog中恢复的，重启速度会很快，因为shard recovery过程会很快。
+用下面这行命令执行flush：POST _flush/synced。但是flush操作是尽量执行的，有可能会执行失败，如果有大量的index写入操作的话。所以可能需要多次执行flush，直到它执行成功。
+
+    curl -XPOST 'http://localhost:9200/_flush/synced?pretty'
+
+* （3）停止一个node然后升级这个node
+
+在完成node的shard allocation禁用以及flush操作之后，就可以停止这个node。
+如果安装了一些插件，或者是设置过jvm.options文件的话，需要先将/usr/local/elasticsearch/plugins拷贝出来，作为一个备份，jvm.options也拷贝出来。
+将老的es安装目录删除，然后将最新版本的es解压缩，而且要确保我们绝对不会覆盖config、data、log等目录，否则就会导致我们丢失数据、日志、配置文件还有安装好的插件。
+
+    kill -SIGTERM 15516
+
+* （4）升级plugin
+
+可以将备份的plugins目录拷贝回最新解压开来的es安装目录中，包括jvm.options。去官网，找到各个plugin的git地址，git地址上，都有每个plugin version跟es version之间的对应关系。
+要检查一下所有的plugin是否跟要升级的es版本是兼容的，如果不兼容，那么需要先用elasticsearch-plugin脚本重新安装最新版本的plugin。
+
+* （5）启动es node
+
+接着要注意在启动es的时候，在命令行里用-Epath.conf= option来指向一个外部已经配置好的config目录。这样的话最新版的es就会复用之前的所有配置了，而且也会根据配置文件中的地址，找到对应的log、data等目录。
+然后再日志中查看这个node是否正确加入了cluster，也可以通过下面的命令来检查：GET _cat/nodes。
+
+    elasticsearch -d -Epath.conf=/etc/elasticsearch
+
+* （6）在node上重新启用shard allocation
+
+一旦node加入了cluster之后，就可以重新启用shard allocation
+
+    curl -XPUT 'http://localhost:9200/_cluster/settings?pretty' -d '
+    {
+      "persistent": {
+        "cluster.routing.allocation.enable": "all"
+      }
+    }'
+
+* （7）等待node完成shard recover过程
+
+我们要等待cluster完成shard allocation过程，可以通过下面的命令查看进度：GET _cat/health。一定要等待cluster的status从yellow变成green才可以。green就意味着所有的primary shard和replica shard都可以用了。
+
+    curl -XGET 'http://localhost:9200/_cat/health?pretty'
+
+在rolling upgrade期间，primary shard如果分配给了一个更新版本的node，是一定不会将其replica复制给较旧的版本的node的，因为较新的版本的数据格式跟较旧的版本是不兼容的。
+但是如果不允许将replica shard复制给其他node的话，比如说此时集群中只有一个最新版本的node，那么有些replica shard就会是unassgied状态，此时cluster status就会保持为yellow。
+此时，就可以继续升级其他的node，一旦其他node变成了最新版本，那么就会进行replica shard的复制，然后cluster status会变成green。
+
+如果没有进行过flush操作的shard是需要一些时间去恢复的，因为要从translog中恢复一些数据出来。可以通过下面的命令来查看恢复的进度：GET _cat/recovery。
+
+* （8）重复上面的步骤，直到将所有的node都升级完成
+
+### 16.12 es生产集群版本升级之基于集群整体重启策略进行2.x到5.x的大版本升级
+
+滚动升级策略，集群，集群里面有多个节点，一个节点一个节点的重启和升级。如果大版本之间的升级，集群重启策略，要先将整个集群全部停掉，如果采取滚动升级策略的话，可能导致一个集群内有些节点是es 5.5，有些节点是es 2.4.3，这样的话是可能会有问题的；
+升级的过程，其实是跟之前的一模一样的。es在进行重大版本升级的时候，一般都需要采取full cluster restart的策略，重启整个集群来进行升级。rolling upgrade在重大版本升级的时候是不合适的。
+执行一个full cluster restart升级的过程如下：
+
+* （1）禁止shard allocation
+
+停止一个node时，可能导致部分replica shard死掉了，此时shard allocation机制会立即在其他节点上分配一些replica shard过去。如果是停止node导致primary shard死掉了，会将其他node上的replica shard提升为primary shard，
+同理会给其复制足够的replica shard，保持replica副本数量。但是这回导致大量的IO开销。我们首先得先禁止这个机制：
+
+    curl -XPUT 'http://localhost:9200/_cluster/settings?pretty' -d '
+    {
+      "persistent": {
+        "cluster.routing.allocation.enable": "none"
+      }
+    }'
+
+* （2）执行一次flush操作
+
+最好是停止接受新的index写入操作，并且执行一次flush操作，确保数据都fsync到磁盘上。这样的话，确保没有数据停留在内存和WAL日志中。shard recovery的时间就会很短。
+
+    curl -XPOST 'http://localhost:9200/_flush/synced?pretty'
+
+此时，最好是执行synced flush操作，因为我们最好是确保flush操作成功了，再执行下面的操作。如果flush操作报错了，那么可以反复多执行几次。
+
+* （3）关闭和升级所有的node
+
+如果是将es 2.x版本升级到es 5.x版本，唯一的区别就在这里开始了，先将整个集群中所有的节点全部停止。将最新版本的es解压缩替代之前的es安装目录之前，一定要记得先将plugins做个备份。
+将集群上所有node上的es服务都给停止，然后按照rolling upgrade中的步骤对集群中所有的node进行升级。将所有的节点全部停掉，将所有的node全部替换为最新版本的es安装目录
+
+* （4）升级plugin
+
+最新版的es解压开来以后，就可以看看，可以去做一个plugin的升级；es plugin的版本是跟es版本相关联的，因此必须使用elasticsearch-plugin脚本来安装最新的plugin版本
+
+* （5）启动cluster集群
+
+如果我们有专门的master节点的话，就是那些将node.master设置为true的节点（默认都是true，都有能力作为master节点），而且node.data设置为false，那么就先将master node启动。
+等待master node组建成一个cluster之后，这些master node中会选举一个正式的master node出来。可以在log中检查master的选举。
+
+只要minimum number of master-eligible nodes数量的node发现了彼此，他们就会组成一个cluster，并且选举出来一个master。从这时开始，可以监控到加入cluster的node。依次将所有的node重新启动起来
+
+* （6）等待cluster状态变成yellow
+
+只要每个ndoe都加入了cluster，就会开始对primary shard进行receover过程，就是看有没有数据在WAL日志中的，给恢复到内存里。刚开始的话，_cat/health请求会反馈集群状态是red，这意味着不是所有的primary shard都被分配了。
+只要每个node发现了自己本地的shard之后，集群status就会变成yellow，意味着所有的primary shard都被发现了，但是并不是所有的replica shard都被分配了。
+
+* （7）重新启用allocation
+
+直到所有的node都加入了集群，再重新启用shard allocation，可以让master将replica分配给那些本地已经有replica shard的node上。
+
+    curl -XPUT 'http://localhost:9200/_cluster/settings?pretty' -d '
+    {
+      "persistent": {
+        "cluster.routing.allocation.enable": "all"
+      }
+    }'
+
+cluster这个时候就会开始将replica shard分配给data node。此时可以恢复index和search操作，不过最好还是等待replica shard全部分配完之后，再去恢复读写操作。可以通过下面的api来监控这个过程
+
+    GET _cat/health
+    GET _cat/recovery
+
+如果_cat/health中的status列变成了green，那么所有的primary和replica shard都被成功分配了
+
+### 16.13 es生产集群版本升级之基于索引重建策略进行跨多个大版本的升级
+
+es包含了向后兼容性的代码，从而允许上一个大版本的索引可以直接在这个版本中使用，即es只能使用上一个大版本创建的索引。举例来说，es 5.x可以使用es 2.x中的索引，但是不能使用es 1.x中的索引。
+如果使用过于陈旧的索引去启动，就会启动失败。如果我们在运行es 2.x集群，但是索引是从2.x之前的版本创建的，那么在升级到es 5.x之前，需要删除旧索引，或者reindex这些索引，用reindex in place的策略。
+
+如果在运行es 1.x的集群，有两个选择，首先升级到es 2.4.x，然后reindex所有的旧索引，用reindex in place的策略，接着升级到es 5.x。创建一个新的5.x集群，然后使用reindex-from-remote直接从es 1.x集群中将索引倒入5.x集群中。
+同时运行一个es 1.x的集群，同时也运行一个es 5.x的集群，然后用reindex功能，将es 1.x中的所有数据都导入到es 5.x集群中。
+
+* （1）reindex in place
+
+这个是1.x版本的elasticsearch migration plugin
+
+* （2）upgrading with reindex-from-remote
+
+如果在运行1.x cluster，并且想要直接迁移到5.x，而不是先迁移到2.x，那么需要进行reindex-from-remote操作。
+es包含了向后兼容性的代码，从而允许上一个大版本的索引可以直接在这个版本中使用。如果要直接从1.x升级到5.x，我们就需要自己解决向后兼容性的问题。
+首先我们需要先建立一个新的5.x的集群。5.x集群需要能够访问1.x集群的rest api接口。
+
+对于每个想要迁移到5.x集群的1.x的索引，需要做下面这些事情：
+
+在5.x中创建新的索引，以及使用合适的mapping和setting，将refresh_interval设置为-1，并且设置number_of_replica为0，主要是为了更快的reindex。
+用reindex from remote的方式，在两个集群之间迁移index数据
+
+    curl -XPOST 'http://localhost:9201/_reindex?pretty' -d '
+    {
+      "source": {
+        "remote": {
+          "host": "http://localhost:9200"
+        },
+        "index": "forum"
+      },
+      "dest": {
+        "index": "forum"
+      }
+    }'
+
+remote cluster必须显示在elasticsearch.yml中列入白名单中，使用reindex.remote.whitelist属性
+
+reinde过程中会使用的默认的on-heap buffer最大大小是100mb，如果要迁移的数据量很大，需要将batch size设置的很小，这样每次同步的数据就很少，使用size参数。
+还可以设置socket_timeout和connect_timeout，比如下面：
+
+    POST _reindex
+    {
+      "source": {
+        "remote": {
+          "host": "http://otherhost:9200",
+          "socket_timeout": "1m",
+          "connect_timeout": "10s"
+        },
+        "index": "source",
+        "size": 10,
+        "query": {
+          "match": {
+            "test": "data"
+          }
+        }
+      },
+      "dest": {
+        "index": "dest"
+      }
+    }
+
+如果在后台运行reindex job，就是将wait_for_completion设置为false，那么reindex请求会返回一个task_id，后面可以用来监控这个reindex progress的进度，GET _tasks/TASK_ID。
+一旦reindex完成之后，可以将refresh_interval和number_of_replicas设置为正常的数值，比如30s和1；一旦新的索引完成了replica操作，就可以删除旧的index了。
+
+## 十七、生产集群中的索引管理
+
+> 由于集群搭建对机器要求较高，下面这些是文档中基于5.x的
+
+### 17.1 索引增删查改
+
+#### 1、创建索引
+
+（1）创建索引的语法
+
+用settings给这个索引在创建时可以添加一些设置，还有可以初始化一些type的mapping
+
+    curl -XPUT 'http://elasticsearch02:9200/twitter?pretty' -d '
+    {
+        "settings" : {
+            "index" : {
+                "number_of_shards" : 3, 
+                "number_of_replicas" : 2 
+            }
+        },
+        "mappings" : {
+            "properties" : {
+                "field1" : { "type" : "text" }
+            }
+        }
+    }'
+
+* （2）索引创建返回消息的解释
+
+默认情况下，索引创建命令会在每个primary shard的副本开始进行复制以后，或者是请求超时以后，返回一个响应消息，类似下面这样的。
+其中acknowledged表明了这个索引有没有创建成功，shards_acknowledged表明了每个primary shard有没有足够数量的replica开始进行复制了。有可能这两个参数会为false，但是索引依然可以创建成功。
+因为这些参数仅仅是表明在请求超时之前，那两个行为有没有成功，也有可能请求超时了，在超时前都没成功，但是超时后在es server端还是都执行了。
+如果acknoledged是false，那么就可能是超时了，此时接受到响应消息的时候，cluster state都还没变更，没有加入新创建的index，但是也许之后还是会创建这个index。
+如果shards_acknowledged是false，那么可能在primary shard进行副本copy之前，就timeout了，但是此时也许index创建成功了，而且cluster state已经加入了新创建的index。
+
+    {
+        "acknowledged": true,
+        "shards_acknowledged": true
+    }
+
+#### 2、删除索引
+
+    curl -XDELETE 'http://elasticsearch02:9200/twitter?pretty'
+
+#### 3、查询索引设置信息
+
+    curl -XGET 'http://elasticsearch02:9200/twitter?pretty'
+
+#### 4、打开/关闭索引
+
+    curl -XPOST 'http://elasticsearch02:9200/twitter/_close?pretty'
+    curl -XPOST 'http://elasticsearch02:9200/twitter/_open?pretty'
+
+    curl -XPUT 'http://elasticsearch02:9200/twitter/_doc/1?pretty' -d '
+    {
+        "field1": "1"
+    }'
+
+如果关闭了一个索引之后，那么这个索引是不会带来任何的性能开销了，只要保留这个索引的元数据即可，然后对这个索引的读写操作都不会成功。
+一个关闭的索引可以接着再打开，打开以后会进行shard recovery过程。
+
+比如说你在做一些运维操作的时候，现在你要对某一个索引做一些配置，运维操作，修改一些设置，关闭索引，不允许写入，成功以后再打开索引
+
+#### 5、压缩索引
+
+shrink命令可以将一个已有的索引压缩成一个新的索引，同时primary shard会更少。因为以前提到过，primary shard因为涉及到document的hash路由问题，所以是不允许修改的。
+但是如果要减少index的primary shard，可以用shrink命令来压缩index。但是压缩后的shard数量必须可以被原来的shard数量整除。
+举例来说，一个有8个primary shard的index可以被压缩成4个，2个，或者1个primary shard的index。
+
+如果你的索引中本来是要保留7天的数据，那么给了10个shard，但是现在需求变了，这个索引只要保留3天的数据就可以了，那么数据量变小了，就不需要10个shard了，就可以做shrink操作，5个shard。
+
+shrink命令的工作流程如下：
+
+* （1）首先，它会创建一个跟source index的定义一样的target index，但是唯一的变化就是primary shard变成了指定的数量
+* （2）接着它会将source index的segment file直接用hard-link的方式连接到target index的segment file，如果操作系统不支持hard-link，
+那么就会将source index的segment file都拷贝到target index的data dir中，会很耗时。如果用hard-link会很快
+* （3）最后，会将target index进行shard recovery恢复
+
+如果要shrink index，那么这个index必须先被标记为`read only`，而且这个index的每个shard的某一个copy，可以是primary或者是replica，都必须被复制到一个节点上去。
+默认情况下，index的每个shard有可能在不同机器上的，比如说，index有5个shard，shard0和shard1在机器1上，shard2、shard3在机器2上，shard4在机器3上。
+现在还得把shard0，shard1，shard2，shard3，shard4全部拷贝到一个同一个机器上去，但是可以是shard0的replica shard。而且每个primary shard都必须存在。
+可以通过下面的命令来完成。其中index.routing.allocation.require._name必须是某个node的名称，这个都是可以自己设置的。
+
+    curl -XPUT 'http://elasticsearch02:9200/twitter/_settings?pretty' -d '
+    {
+      "settings": {
+        "index.routing.allocation.require._name": "node-elasticsearch-02", 
+        "index.blocks.write": true 
+      }
+    }'
+
+这个命令会花费一点时间将source index每个shard的一个copy都复制到指定的node上去，可以通过GET _cat/recovery?v命令来追踪这个过程的进度。
+等上面的shard copy relocate过程结束之后，就可以shrink一个index，用下面的命令即可：POST my_source_index/_shrink/my_target_index。
+如果target index被添加进了cluster state之后，这个命令就会立即返回，不是等待shrink过程完成之后才返回的。当然还可以用下面的命令来shrink的时候修改target index的设置，在settings里就可以设置target index的primary shard的数量。
+
+    curl -XPOST 'http://elasticsearch02:9200/twitter/_shrink/twitter_shrinked?pretty' -d '
+    {
+      "settings": {
+        "index.number_of_replicas": 1,
+        "index.number_of_shards": 1, 
+        "index.codec": "best_compression" 
+      }
+    }'
+
+当然也是需要监控整个shrink的过程的，用GET _cat/recovery?v即可。
+
+#### 6、rollover index
+
+rollover命令可以将一个alias重置到一个新的索引上去，如果已经存在的index被认为太大或者数据太旧了。这个命令可以接收一个alias名称，还有一系列的condition。
+如果索引满足了condition，那么就会创建一个新的index，同时alias会指向那个新的index。比如下面的命令。举例来说，有一个logs-0000001索引，给了一个别名是logs_write，接着发起了一个rollover的命令，如果logs_write别名之前指向的那个index，也就是logs-0000001，创建了超过7天，或者里面的document已经超过了1000个了，然后就会创建一个logs-000002的索引，同时logs_write别名会指向新的索引。
+
+这个命令其实是很有用的，特别是针对这种用户访问行为日志的数据，或者是一些联机事务系统的数据的进入，你可以写一个shell脚本，每天0:00的时候就执行以下rollover命令，此时就判断，如果说之前的索引已经存在了超过1天了，那么此时就创建一个新的索引出来，同时将别名指向新的索引。自动去滚动创建新的索引，保持每个索引就只有一个小时，一天，七天，三天，一周，一个月。
+类似用es来做日志平台，就可能分布式电商平台，可能订单系统的日志，单独的一个索引，要求的是保留最近3天的日志就可以了。交易系统的日志，是单独的一个索引，要求的是保留最近30天的日志。
+这个过程常见于网站用户行为日志数据，比如按天来自动切分索引，写个脚本定时去执行rollover，就会自动不断创建新的索引，但是别名永远是一个，对于外部的使用者来说，用的都是最新的数据索引。
+
+举一个简单的例子，这块是怎么玩儿的，比如说用es做网站的实时用户行为分析，要求的是一个索引只要保留当日的数据就可以了，那么就可以用这个rollover的策略，确保每个索引都是包含当日的最新数据的。老的数据，就变成别的索引了，此时可以写一个shell脚本，删除旧的数据，这样的话，es里就保留当前最新的数据就可以了。也可以根据你的需求，就保留最近7天的数据，但是最新一天的数据在一个索引中，供分析查询使用。
+
+默认情况下，如果已经存在的那个索引是用-符号加上一个数字结尾的，比如说logs-000001，那么新索引的名称就会是自动给那个数字加1，比如logs-000002，自动就是给一个6位的数字，而且会自动补零。但是我们也可以自己指定要的新的索引名称，比如下面这样：
+
+    POST /my_alias/_rollover/my_new_index_name
+    {
+      "conditions": {
+        "max_age":   "7d",
+        "max_docs":  1000
+      }
+    }
+
+可以将rollover命令和date日期结合起来使用，比如下面的例子，先创建了一个logs-2016.10.31-1格式的索引。接着每次如果成功rollover了，那么如果是在当天rollover了多次，那就是当天的日期，末尾的数字递增。如果是隔天才rollover，会自动变更日期，同时维护末尾的数字序号。
+
+    PUT /%3Clogs-%7Bnow%2Fd%7D-1%3E 
+    {
+      "aliases": {
+        "logs_write": {}
+      }
+    }
+    
+    PUT logs_write/log/1
+    {
+      "message": "a dummy log"
+    }
+    
+    POST logs_write/_refresh
+
+> # Wait for a day to pass
+
+    POST /logs_write/_rollover 
+    {
+      "conditions": {
+        "max_docs":   "1"
+      }
+    }
+
+当然，还可以在rollover的时候，给新的index进行新的设置：
+
+    POST /logs_write/_rollover
+    {
+      "conditions" : {
+        "max_age": "7d",
+        "max_docs": 1000
+      },
+      "settings": {
+        "index.number_of_shards": 2
+      }
+    }
+
+### 17.2 索引的mapping管理
+#### 1、mapping管理
+
+put mapping命令可以让我们给一个已有的索引添加或修改一些配置：
+
+    curl -XPUT 'http://elasticsearch02:9200/twitter?pretty' -d ' 
+    {
+      "mappings": {
+          "properties": {
+            "message": {
+              "type": "text"
+            }
+          }
+      }
+    }'
+
+下面这个命令是给一个已有的索引添加一个type
+
+    curl -XPUT 'http://elasticsearch02:9200/twitter/_mapping?pretty' -d ' 
+    {
+      "properties": {
+        "name": {
+          "type": "text"
+        }
+      }
+    }'
+
+下面这个命令是给一个已有的type添加一个field
+
+    curl -XPUT 'http://elasticsearch02:9200/twitter/_mapping?pretty' -d '
+    {
+      "properties": {
+        "user_name": {
+          "type": "text"
+        }
+      }
+    }'
+
+查看某个type的mapping映射信息
+
+    curl -XGET 'http://elasticsearch02:9200/twitter/_mapping?pretty'
+
+看某个type的某个field的映射信息
+    
+    curl -XGET 'http://elasticsearch02:9200/twitter/_mapping/_doc/field/message?pretty'
+
+mapping管理是运维中，索引管理中，很基础的一块
+
+#### 2、索引别名管理
+
+    curl -XPOST 'http://elasticsearch02:9200/_aliases?pretty' -d '
+    {
+        "actions" : [
+            { "add" : { "index" : "twitter", "alias" : "twitter_prod" } }
+        ]
+    }'
+
+    curl -XPOST 'http://elasticsearch02:9200/_aliases?pretty' -d '
+    {
+        "actions" : [
+            { "remove" : { "index" : "twitter", "alias" : "twitter_prod" } }
+        ]
+    }'
+
+    POST /_aliases
+    {
+        "actions" : [
+            { "remove" : { "index" : "test1", "alias" : "alias1" } },
+            { "add" : { "index" : "test2", "alias" : "alias1" } }
+        ]
+    }
+
+    POST /_aliases
+    {
+        "actions" : [
+            { "add" : { "indices" : ["test1", "test2"], "alias" : "alias1" } }
+        ]
+    }
+
+上面是给某个index添加和删除alias的命令，还有重命名alias的命令（先删除再添加），包括将一个alias绑定多个index
+
+    POST /_aliases
+    {
+        "actions" : [
+            {
+                "add" : {
+                     "index" : "test1",
+                     "alias" : "alias2",
+                     "filter" : { "term" : { "user" : "kimchy" } }
+                }
+            }
+        ]
+    }
+
+    DELETE /logs_20162801/_alias/current_day
+
+    GET /_alias/2016
+
+索引别名，还是挺有用的，主要是什么呢，就是说，可以将一个索引别名底层挂载多个索引，比如说7天的数据
+
+索引别名常常和之前讲解的那个rollover结合起来，我们为了性能和管理方便，每天的数据都rollover出来一个索引，但是在对数据分析的时候，可能是这样子的，有一个索引access-log，指向了当日最新的数据，
+用来计算实时数据的; 有一个索引access-log-7days，指向了7天的7个索引，可以让我们进行一些周数据的统计和分析。
+
+#### 3、index settings管理
+
+    curl -XPUT 'http://elasticsearch02:9200/twitter/_settings?pretty' -d '
+    {
+        "index" : {
+            "number_of_replicas" : 1
+        }
+    }'
+
+    curl -XGET 'http://elasticsearch02:9200/twitter/_settings?pretty'
+
+经常可能要对index做一些settings的调整，常常和之前的index open和close结合起来
+
+#### 4、index template管理
+
+我们可以定义一些index template，这样template会自动应用到新创建的索引上去。template中可以包含settings和mappings，还可以包含一个pattern，决定了template会被应用到哪些index上。
+而且template仅仅在index创建的时候会被应用，修改template，是不会对已有的index产生影响的。
+
+    curl -XPUT 'http://elasticsearch02:9200/_template/template_access_log?pretty' -d '
+    {
+      "template": "access-log-*",
+      "settings": {
+        "number_of_shards": 2
+      },
+      "mappings": {
+        "log": {
+          "_source": {
+            "enabled": false
+          },
+          "properties": {
+            "host_name": {
+              "type": "keyword"
+            },
+            "created_at": {
+              "type": "date",
+              "format": "EEE MMM dd HH:mm:ss Z YYYY"
+            }
+          }
+        }
+      },
+      "aliases" : {
+          "access-log" : {}
+      }
+    }'
+
+    curl -XDELETE 'http://elasticsearch02:9200/_template/template_access_log?pretty'
+
+    curl -XGET 'http://elasticsearch02:9200/_template/template_access_log?pretty'
+
+    curl -XPUT 'http://elasticsearch02:9200/access-log-01?pretty'
+    
+    curl -XGET 'http://elasticsearch02:9200/access-log-01?pretty'
+
+index template，可能是这样子的，就是你可能会经常创建不同的索引，比如说商品，分成了多种，每个商品种类的数据都很大，可能就是说，一个商品种类一个索引，
+但是每个商品索引的设置是差不多的，所以干脆可以搞一个商品索引模板，然后每次新建一个商品种类索引，直接绑定到模板，引用相关的设置
+
+### 17.3 segment和share
+
+#### 1、indice stat
+
+indice stat对index上发生的不同类型的操作都提供了统计。这个api提供了index level的统计信息，不过大多数统计信息也可以从node level获取。
+
+    curl -XGET 'http://elasticsearch02:9200/twitter/_stats?pretty'
+
+这里包括了doc数量，index size，segment的内存使用量，merge，flush，refresh，translog等底层机制的统计信息。
+
+#### 2、segment
+
+查看low level的lucene的segment信息，可以用来查看shard和index的更多的信息，包括一些优化信息，因为delete而浪费的数据空间，等等。
+
+    curl -XGET 'http://elasticsearch02:9200/twitter/_segments?pretty'
+
+    返回如下结果
+    
+    {
+        ...
+            "_3": {
+                "generation": 3,
+                "num_docs": 1121,
+                "deleted_docs": 53,
+                "size_in_bytes": 228288,
+                "memory_in_bytes": 3211,
+                "committed": true,
+                "search": true,
+                "version": "4.6",
+                "compound": true
+            }
+        ...
+    }
+
+* _3，是segment的名称，这个名称跟这个segment files的文件名有关系，一个segment的所有文件都是用这个名称开头的
+* generation：每次新生成一个segment，就会递增一个数值，segment名称也就是这个数值
+* num_docs：在这个segment中存储的没有被删除的document的数量
+* deleted_docs：在这个segment中存储的被删除的document数量，这个数值是无所谓的，因为每次segment merge的时候都会删除这些document
+* size_in_bytes：这个segment占用的磁盘空间
+* memory_in_bytes：segment需要将一些数据缓存在内存中，这样搜索性能才能更高，这个数值就是segment占用的内存的空间大小
+* committed：segment是否被sync到磁盘上去了，commit/sync的segment可以确保数据不会丢失，但是即使这个值是false也不要紧，因为数据同时被存储在了translog里面，
+es进程重启的时候，是可以重放translog中的日志来恢复数据的
+* search：这个segment能不被搜索，如果是false的话，可能这个segment已经被sync到磁盘上，但是还没有进行refresh，所以不能被搜索
+* version：lucene的版本号
+* compound：如果是true的话，意味着lucene将这个segment所有的文件都merge成了一个文件，进而可以节省file descriptor的消耗
+
+#### 3、shard存储信息
+
+查询索引shard copy的存储信息，可以看到哪些节点上有哪些shard copy，shard copy的allocation id，每个shard copy的唯一标识，包括打开索引的时候遇到的报错。
+默认情况下，会显示至少有一个未分配的copy的shard，如果cluster health是yellow，会显示至少有一个未分配的replica的shard，当cluster health是red，会显示有未分配的primary的shard。
+但是用status=green可以看到每个shard的信息。
+
+    curl -XGET 'http://elasticsearch02:9200/twitter/_shard_stores?pretty'
+    curl -XGET 'http://elasticsearch02:9200/twitter/_shard_stores?status=green&pretty'
+
+    {
+        ...
+       "0": { 
+            "stores": [ 
+                {
+                    "sPa3OgxLSYGvQ4oPs-Tajw": { 
+                        "name": "node_t0",
+                        "transport_address": "local[1]",
+                        "attributes": {
+                            "mode": "local"
+                        }
+                    },
+                    "allocation_id": "2iNySv_OQVePRX-yaRH_lQ", 
+                    "legacy_version": 42, 
+                    "allocation" : "primary" | "replica" | "unused", 
+                    "store_exception": ... 
+                },
+                ...
+            ]
+       },
+        ...
+    }
+
+* 0：shard id
+* stores：shard的每个copy的store信息
+* sPa3OgxLSYGvQ4oPs-Tajw：node id，持有一个copy的node信息
+* allocationi_id：copy的allocationid
+* allocation：shard copy的角色
+
+#### 4、clear cache
+
+    curl -XPOST 'http://elasticsearch02:9200/twitter/_cache/clear?pretty'，这个命令可以清空所有的缓存
+
+#### 5、flush
+
+flush API可以让我们去强制flush多个索引，索引flush以后，就会释放掉这个索引占用的内存，因为会将os cache里的数据强制fsync到磁盘上去，同时还会清理掉translog中的日志。
+默认情况下，es会不定时自动触发flush操作，以便于及时清理掉内存。POST twitter/_flush，这条命令即可。
+flush命令可以接受下面两个参数，wait_if_going，如果设置为true，那么flush api会等到flush操作执行完以后再返回，即使需要等待其他的flush操作先完成。
+默认的值是false，这样的话，如果有其他flush操作在执行，就会报错；force，如果没有必要flush的话，是不是会强制一个flush
+
+    curl -XPOST 'http://elasticsearch02:9200/twitter/_flush?pretty'
+
+#### 6、refresh
+
+refresh用来显式的刷新一个index，这样可以让这个refresh之前执行的所有操作，都处于可见的状态。POST twitter/_refresh
+
+    curl -XPOST 'http://elasticsearch02:9200/twitter/_refresh?pretty'
+
+#### 7、force merge
+
+force merge API可以强制合并多个索引文件，可以将一个shard对应的lucene index的多个segment file都合并起来，可以减少segment file的数量。POST /twitter/_forcemerge。
+
+    curl -XPOST 'http://elasticsearch02:9200/twitter/_forcemerge?pretty'
+
+### 17.4 fielddata
+
+#### 1、circuit breaker
+
+es有很多的断路器，也就是circuit breaker，可以用来阻止各种操作导致OOM内存溢出。每个断路器都有一个限制，就是最多可以使用多少内存。此外，还有一个父断路器指定了所有断路器最多可以使用多少内存。
+
+* （1）父短路器
+
+indices.breaker.total.limit，可以配置父短路器的最大内存限制，默认是jvm heap内存的70%
+
+* （2）fielddata短路器
+
+field data短路器可以估算每一个field的所有数据被加载到内存中，需要耗费多大的内存。这个短路器可以组织field data加载到jvm内存时发生OOM问题。
+默认的值是jvm heap的60%。indices.breaker.fielddata.limit，可以用这个参数来配置。indices.breaker.fielddata.overhead，可以配置估算因子，估算出来的值会乘以这个估算因子，留一些buffer，默认是1.03。
+
+* （3）request circuit breaker
+
+request circuit breaker会阻止每个请求对应的一些数据结构造成OOM，比如一个聚合请求可能会用jvm内存来做一些汇总计算。indices.breaker.request.limit，最大是jvm heap的60%。
+indices.breaker.request.overhead，估算因子，默认是1.
+
+* （4）in flight request circuit breaker
+
+flight request circuit breaker可以限制当前所有进来的transport或http层的请求超出一个节点的内存总量，这个内存的使用量就是请求自己本身的长度。
+network.breaker.inflight_requests.limit，默认是jvm heap的100%。network.breaker.inflight_requests.overhead，估算因子，默认是1.
+
+* （5）script compilation circuit breaker
+
+这个短路器可以阻止一段时间内的inline script编译的数量。script.max_compilations_per_minute，默认是1分钟编译15个。
+
+#### 2、fielddata
+
+fielddata cache，在对field进行排序或者聚合的时候，会用到这个cache。这个cache会将所有的field value加载到内存里来，这样可以加速排序或者聚合的性能。
+但是每个field的field data cache的构建是很成本很高昂的，因此建议给机器提供充足的内存来保持fielddata cache。
+
+indices.fielddata.cache.size，这个参数可以控制这个cache的大小，可以是30%这种相对大小，或者是12GB这种绝对大小，默认是没有限制的。
+
+fielddata的原理之前讲解过了，其实是对分词后的field进行排序或者聚合的时候，才会使用fielddata这种jvm内存数据结构。
+如果是对普通的未分词的field进行排序或者聚合，其实默认是用的doc value数据结构，是在os cache中缓存的。
+
+#### 3、node query cache
+
+query cache用来缓存query的结果，每个node都有一个query cache，使用的是LRU策略，会自动清理数据。但是query cache仅仅会对那些filter后的数据进行缓存，对search后的数据是不会进行缓存的。
+indices.queries.cache.size，控制query cache的大小，默认是jvm heap的10%。
+
+如果只是要根据一些field进行等值的查询或过滤，那么用filter操作，性能会比较好，query cache
+
+#### 4、index buffer
+
+index buffer用来存储最新索引的的document。如果这个buffer满了之后，document就会被写入一个segment file，但是此时其实是写入os cache中，没有用fsync同步到磁盘，
+这就是refresh过程，写入os cache中，就可以被搜索到了。然后flush之后，就fsync到了磁盘上。indices.memory.index_buffer_size，控制index buffer的大小，默认是10%。
+indices.memory.min_index_buffer_size，buffer的最小大小，默认是48mb。
+
+index buffer，增删改document，数据先写入index buffer，写到磁盘文件里面去，不可见的，refresh刷入磁盘文件对应的os cache里面，还有translog一份数据
+
+#### 5、shard request cache
+
+对于分布式的搜索请求，相关的shard都会去执行搜索操作，然后返回一份结果集给一个coordinate node，由那个coordinate node来执行最终的结果合并与计算。
+shard request cache会缓存每个shard的local result。那么对于频繁请求的数据，就可以直接从cache中获取了。与query cache不同的是，query cache只是针对filter的，
+但是shard request cache是针对所有search和聚合求的。
+
+默认情况下，shard request cache仅仅会针对size=0的搜索来进行缓存，仅仅会缓存hits.total，聚合结果等等汇总结果，而不会缓存搜索出来的hits明细数据。
+
+cache是很智能的，如果cache对应的doc数据被refresh，也就是修改了，那么cache就会自动失效。如果cache满了的话，也会自动用LRU算法来清理掉cache中的数据。
+
+可以手动来启用和禁用cache：
+
+    PUT /my_index
+    {
+      "settings": {
+        "index.requests.cache.enable": false
+      }
+    }
+
+在每个request中也可以手动启用或禁用cache：
+
+    GET /my_index/_search?request_cache=true
+    {
+      "size": 0,
+      "aggs": {
+        "popular_colors": {
+          "terms": {
+            "field": "colors"
+          }
+        }
+      }
+    }
+
+但是默认对于size>0的request的结果是不会被cache的，即使在index设置中启用了request cache也不行。只有在请求的时候，手动加入reqeust cache参数，才可以对size>0的请求进行result cache。
+缓存用的key，是完整的请求json，因此每次请求即使json中改变了一点点，那么也无法复用上次请求的request cache结果。indices.requests.cache.size，可以设置request cache大小，默认是1%
+
+`GET /_stats/request_cache?human`，监控request cache的使用
+
+如果是search，默认是不缓存的，除非你手动打开request_cache=true，在发送请求的时候
+如果是aggr，默认是缓存的，不手动打开request_cache=true，也会缓存聚合的结果
+
+#### 6、索引恢复
+
+indices.recovery.max_bytes_per_sec，每秒可以恢复的数据量，默认是40mb
+
+### 17.5 merge
+
+#### 1、merge
+
+es里的一个shard，就是一个lucene index，每个lucene index都是由多个segment file组成的。segment file负责存储所有的document数据，而且segment file是不可变的。
+一些小的segment file会被merge成一个大的segment file，这样可以保证segment file数量不会膨胀太多，而且可以将删除的数据实际上做物理删除。
+merge过程会自动进行throttle限流，这样可以让merge操作和节点上其他的操作都均衡使用硬件资源。
+
+merge scheduler会控制merge的操作什么时候执行，merge操作会在一些独立的后台线程中执行，如果达到了最大的线程数量的话，那么merg操作就会等待有空闲的线程出来再去执行。
+index.merge.scheduler.max_thread_count，这个参数可以控制每次merge操作的最大线程数量，默认的公式是Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() / 2))，
+对于SSD来说，表现是很好的。但是如果我们使用的是机械硬盘，建议将这个数量降低为1。
+
+#### 2、translog
+
+* （1）translog介绍
+
+对lucene的磁盘持久化，可以通过一次lucene commit来提交，是一个很重的过程，所以是不可能在每次插入或者删除操作过后来执行的。
+所以在上一次提交和下一次提交之间的数据变更，都是在os cache中的，如果机器挂掉，可能导致数据丢失。
+为了避免这种数据丢失，每个shard都有一个transaction log，也就是translog，来写入write ahead log，预写日志。任何写入数据都会同时被写入translog。
+如果机器挂掉了，那么就可以重放translog中的日志来恢复shard中的数据。
+
+一次es flush操作，都会执行一次lucene commit，将数据fsync到磁盘上去，同时清空translog文件。在后台会自动进行这个操作，来确保translog日志不会增长的太过于巨大，
+这样的话重放translog数据来恢复，才不会太慢。index.translog.flush_threshold_size，这个参数可以设置os cache中数据达到多大的时候，要执行一次flush，默认是512mb。
+
+* （2）translog设置
+
+此外，默认情况下，es每隔5秒钟会在每个增删改操作结束之后，对translog进行一次fsync操作，但是要求index.translog.durability设置为async或者request（默认）。
+es只有在primary和每一个replica shard的translog fsync之后，才会对增删改操作返回的状态中显示为success。
+
+index.translog.sync_interval：不考虑些操作，translog被fsync到磁盘的频率，默认是5秒
+
+index.translog.durability：是否要在每次增删改操作之后，fsync translog。
+
+默认是request，每次写请求之后，都会fsync translog，这样的话，即使机器宕机，但是只要是返回success的操作，就意味着translog被fsync到磁盘了，就可以保证数据不丢失
+
+async，在后台每隔一定时间来fsync translog，默认是5秒，机器宕机的时候，可能导致5秒的数据丢失，可能有5秒钟的数据，数据本身是停留在os cache中的，
+数据对应的translog也停留在os cache中，5秒才能将translog从os cache输入磁盘
+
+* （3）translog损坏怎么办
+
+如果硬盘损坏，可能导致translog出现损坏，es会自动通过checksum来捕获到这个问题，此时es就会认为这个shard故障了，而且禁止将shard分配给这个node，同时会尝试从其他replica shard来恢复数据。
+如果没有replica数据的话，那么用户可以手动通过工具来恢复，使用elasticsearch-translog即可。要注意的是，elasticsaerch-translog工具不能再elasticsearch运行的时候来使用，否则我们可能丢失数据。
+
+## 十八、底层模块深入解析
+
+### 18.1 解析之shard allocation
+
+#### 1、shard allocation的介绍
+
+两种node：master node，data node；master node的一个很重要的功能，比如说，你现在创建了一个索引，然后这个索引是不是有很多的shard，可能你自己指定了几个primary shard，每个primary shard还有一些replica shard。master node，其实就是决定哪些shard分配给哪些node，以及什么时候在node之间移动shard，来让集群达到rebalance。对于shard allocation而言，有很多设置，都可以控制这个过程：
+
+（1）cluster level shard allocation，可以在集群层面来控制shard allocation和rebalance的过程
+（2）disk-based shard allocation，es会在shard分配的时候，考虑可用的磁盘空间
+（3）shard allocation awareness，控制shard如何在不同的机架上进行分布
+（4）shard allocation filter，可以控制有些node不参与allocation的过程，这样的话，这些node就可以被安全的下线
+
+2、cluster level shard allocation
+
+shard allocation，就是将shard分配给node的一个过程，这个过程可能会在集群启动初始化进行恢复的时候发生，也会发生在replica shard被分配的时候，集群进行rebalance的时候，或者是有新的node加入，有旧的node被下线的时候。
+
+（1）shard allocation settings
+
+cluster.routing.allocation.enable
+
+all，默认，对所有类型的shard都允许分配
+primaries，仅仅允许primary shard被分配
+new_primaries，仅仅对新建索引的primary shard允许分配
+none，不允许任何shard被分配
+
+但是这个配置对node重启时本地primary shard的恢复没有影响，重启node的时候，如果本地有一个未被分配的primary shard，还是会立即恢复这个primary shard。
+
+cluster.routing.allocation.node_concurrent_incoming_recoveries：在一个node上允许同时恢复多少个shard，这里的shard recovery过程，指的就是要将某个shard分配给这个node。这个设置的默认值是2.
+
+cluster.routing.allocation.node_concurrent_outgoing_recoveries：一个node上允许同时进行多少个shard recovery outgoing，比如这个node上，有一个primary shard，现在要将replica shard分配给其他的node，那么就是outgoing shard recovery。默认值也是2.
+
+cluster.routing.allocation.node_concurrent_recoveries：同时设置上面两个值
+
+cluster.routing.allocation.node_initial_primaries_recoveries：如果replica shard recovery通过网络传输来分配，那么一个未被分配的primary shard会在node重启之后使用本地磁盘上的数据，这个过程因为是使用本地的数据，因此会比较快，默认值是4.
+
+*****：cluster.routing.allocation.same_shard.host：默认值是false，如果设置为true，那么就不允许将一个primary shard和replica shard分配到同一个物理机上，也许这个物理机上启动了多个es实例。
+
+有可能你有一台超级服务器，32核CPU+128G内存，这个时候的话呢，可能你在这台机器上启动两个es进程，但是默认情况下，有可能一个shard的primary shard被分配到了这台物理机上的node1，同时这个primary shard的replica shard被分配到了这台物理机上的node2，此时，primary shard和replica shard就在同一台物理机上了。
+
+可用性是比较低的，因为如果这台物理机挂掉了，比较惨烈了，primary shard和replica shard全部丢失
+
+（2）shard rebalance settings
+
+rebalance，什么意思，比如说你的集群，有5台机器，一共有100个shard，负载均衡的情况下，平均分配一下呢，每个机器上有20个shard。然后此时加入了一台新机器，6台机器了，此时就要触发rebalance操作，重新让整个集群负载均衡，100 / 6 = 16~17个shard每台机器
+
+如果下线一台机器的话。。。
+
+cluster.routing.rebalance.enable
+
+all，默认，允许对所有类型的shard进行rebalance过程
+primaries，仅仅允许对primary shard进行rebalance过程
+replicas，仅仅允许对replica shard进行rebalance
+none，不允许对任何shard进行rebalance
+
+cluster.routing.allocation.allow_rebalance
+
+always，任何时候都允许rebalance
+indices_primaries_active，仅仅只有在所有的primary shard都被分配之后才允许rebalance
+indices_all_active，默认，仅仅允许所有的primary shard和replica shard都被分配之后，才能rebalance
+
+cluster.routing.allocation.cluster_concurrent_rebalance
+
+允许控制多少个shard rebalance的操作同时运行，默认是2
+
+（3）shard balance heuristics
+
+cluster.routing.allocation.balance.shard：设置每个node的shard分配的权重因子，默认是0.45f，提高权重因子，就会尽可能让均匀的shard分配给集群中的所有node
+
+cluster.routing.allocation.balance.index：定义每个index在一个node上的shard数量因子，默认是0.55f，提高这个参数，就会尽可能让每个index的shard均匀分配到所有的node上
+
+cluster.routing.allocation.balance.threshold：默认是1.0f，提高这个权重因子会导致集群对shard balance有更小的侵略性
+
+3、disk-based shard allocation
+
+es在进行shard allocation的时候，会充分考虑每一个node的可用磁盘空间
+
+cluster.routing.allocation.disk.threshold_enabled：默认是true，如果是false会禁用基于disk的考虑
+
+cluster.routing.allocation.disk.watermark.low：控制磁盘使用率的低水位，默认是85%，如果一个节点的磁盘空间使用率已经超过了85%，那么就不会分配shard给这个node了
+
+cluster.routing.allocation.disk.watermark.high：控制磁盘使用率的高水位，默认是90%，如果一个节点的磁盘空间使用率已经超过90%了，那么就会将这个node上的部分shard移动走
+
+cluster.info.update.interval：es检查集群中每个node的磁盘使用率的时间间隔，默认是30s
+
+cluster.routing.allocation.disk.include_relocations：默认是true，意味着es在计算一个node的磁盘使用率的时候，会考虑正在分配给这个node的shard。
+
+4、shard allocation awareness
+
+（1）机架感知特性
+
+如果在一个物理机上运行多个虚拟机，并且在多个虚拟机中运行了多个es节点，或者在多个机架上，多个机房，都有可能有多个es节点在相同的物理机上，或者在相同的机架上，或者在相同的机房里，那么这些节点就可能会因为物理机，机架，机房的问题，一起崩溃
+
+如果es可以感知到硬件的物理布局，就可以确保说，priamry shard和replica shard一定是分配到不同的物理机，或者物理机架，或者不同的机房，这样可以最小化物理机，机架，机房崩溃的风险
+
+shard allocation awareness可以告诉es我们的硬件架构
+
+举哥例子，如果我们有多个机架，那么我们启动一个node的时候，就要告诉这个node它在哪个机架上，可以给它一个rack_id，比如下面的命令：./bin/elasticsearch -Enode.attr.rack_id=rack_one，也可以在elasticsearch.yml中设置这个机架id
+
+cluster.routing.allocation.awareness.attributes: rack_id
+node.attr.rack_id=rack_one
+
+上面的两行设置里，第一行是设置机架id的属性名称，第二行是用那个机架id属性名称设置具体的机架id
+
+如果启动两个node，都在一个机架上，此时创建一个有5个primary shard和5个replica shard的索引，此时shards会被分配到两个节点上
+
+如果再启动两个node，设置为另外一个机架，此时es会将shard移动到新的node上，去确保说，不会让primary shard和其replica shard在同一个机架上。但是如果机架2故障了，为了恢复集群，那么还是会在恢复的时候，将shards全部在机架1上分配的
+
+prefer local shard机制：在执行search或者get请求的时候，如果启用了shard awareness特性，那么es会尽量使用local shard来执行请求，也就是在同一个awareness group中的shard来执行请求，也就是说尽量用一个机架或者一个机房中的shard来执行请求，而不要跨机架或者跨机房来执行请求
+
+可以指定多个awareness属性，比如机架id和机房名称，类似下面：cluster.routing.allocation.awareness.attributes: rack_id,zone
+
+（2）强制性的感知
+
+如果现在我们有两个机房，并且有足够的硬件资源来容纳所有的shard，但是可能每个机房的硬件只能容纳一半shard，不能容纳所有的shard。如果仅仅使用原始的感知特性，如果一个机房故障了，那么es会将需要恢复的shard全部分配给剩下的一个机房，但是剩下的那个机房的硬件资源并不足以容纳所有的shard。
+
+强制感知特性会解决这个问题，因为这个特性会绝对不允许在一个机房内分配所有的shard
+
+比如说，有一个感知属性叫做zone，有两个机房，zone1和zone2，看看下面的配置：
+
+cluster.routing.allocation.awareness.attributes: zone
+cluster.routing.allocation.awareness.force.zone.values: zone1,zone2 
+
+那么此时如果将2个node分配给zone1机房，然后创建一个索引，5个primary shard和5个replica shard，但是此时只会在zone1机房分配5个primary shard，只有我们启动一批node在zone2机房，才会分配replica shard
+
+5、shard allocation filtering
+
+shard allocation filtering可以让我们允许或者不允许某些index的shard分配给一些特殊的节点，典型的用途，就是如果我们要下线一些node，就可以用这个feature禁止shard分配给这些即将下线的node，而且我们还可以将这些即将下线的节点的shard移动到其他节点。
+
+用下面的命令可以下线一个节点，因为就不允许将shard分配给这个节点了
+
+PUT _cluster/settings
+{
+  "transient" : {
+    "cluster.routing.allocation.exclude._ip" : "10.0.0.1"
+  }
+}
+
+6、node下线时的shard延迟分配
+
+如果从集群中下线一个节点，master会做下面这些事情：
+
+（1）如果那个节点上有primary shard，那么master会将那些primary shard在其他节点上的replica shard提升为primary shard
+（2）分配新的replica shard来保证replica数量充足
+（3）在剩下的各个node上进行shard rebalance，确保负载均衡
+
+这些操作可以保护集群不会丢失数据，因为会对每个shard都复制充足的replica shard
+
+但是这个过程，可能会导致集群中出现很重的负载，包括网络负载和磁盘IO负载，如果那个下线的节点只是因为故障被下线，马上就会有新的节点来顶替它，那么这种立即执行的shard recovery过程是不需要的，考虑下面的场景：
+
+（1）某个node跟集群丢失了网络连接
+（2）master node将那个node上的primary shard对应的其他节点上的replica shard提升为primary shard
+（3）master node分配新的replica shard到其他节点上
+（4）每个新的replica shard都会通过网络传输一份primary shard的完整的副本数据
+（5）很多shard都被移动到其他的node来让集群rebalance
+（6）但是几分钟以后，那个丢失了网络连接的node又重新连接到了集群中
+（7）master节点又要再次进行rebalance操作，因为需要将一些shard分配给那个node
+
+其实如果master node也许只要等待几分钟，那么丢失的那个node自己会回来，丢失的shard也会自动恢复过来，因为数据都在节点的本地，不需要重新拷贝数据以及网络传输，这个过程是非常快速的
+
+index.unassigned.node_left.delayed_timeout，这个参数可以设置某个节点下线之后，对应的replica shard被重新复制和分配的时间等待期，默认是1m，可以通过下面的命令来修改：
+
+PUT _all/_settings
+{
+  "settings": {
+    "index.unassigned.node_left.delayed_timeout": "5m"
+  }
+}
+
+如果启用了delayed allocation之后，那么就会看到下面的场景：
+
+（1）某个node丢失了网络连接
+（2）master将那个node上的一些primary shard对应的其他node上的replica shard提升为primary shard
+（3）master记录下来一条消息日志，这个primary shard的replica shard还没有重新分配和开始，被delayed了，会等待1m
+（4）cluster会保持yellow状态，因为没有足够的replica shard
+（5）那个丢失了的node在几分钟之后，如果回到了集群中
+（6）缺失的那些replica shard会直接分配给那个node，使用其本地的数据即可
+
+如果某个node确定了肯定不会再回到集群中，那么可以通过下面的命令，手动设置一下，直接不等待那个节点回来了
+
+PUT _all/_settings
+{
+  "settings": {
+    "index.unassigned.node_left.delayed_timeout": "0"
+  }
+}
+
+7、索引恢复的优先级
+
+没有被分配的shard都是按照优先级来分配的，有下面几个优先级，index.priority，索引的创建日期，索引名称
+
+PUT index_3
+{
+  "settings": {
+    "index.priority": 10
+  }
+}
+
+8、每个节点的shard数量
+
+cluster.routing.allocation.total_shards_per_node，设置每个节点最多承载的shard数量，默认是无限制的
+
+
+
+
+
+
+ 
 
 
      
