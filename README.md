@@ -8596,214 +8596,520 @@ async，在后台每隔一定时间来fsync translog，默认是5秒，机器宕
 如果硬盘损坏，可能导致translog出现损坏，es会自动通过checksum来捕获到这个问题，此时es就会认为这个shard故障了，而且禁止将shard分配给这个node，同时会尝试从其他replica shard来恢复数据。
 如果没有replica数据的话，那么用户可以手动通过工具来恢复，使用elasticsearch-translog即可。要注意的是，elasticsaerch-translog工具不能再elasticsearch运行的时候来使用，否则我们可能丢失数据。
 
-## 十八、底层模块深入解析
+## 十八、底层模块解析
 
 ### 18.1 解析之shard allocation
 
 #### 1、shard allocation的介绍
 
-两种node：master node，data node；master node的一个很重要的功能，比如说，你现在创建了一个索引，然后这个索引是不是有很多的shard，可能你自己指定了几个primary shard，每个primary shard还有一些replica shard。master node，其实就是决定哪些shard分配给哪些node，以及什么时候在node之间移动shard，来让集群达到rebalance。对于shard allocation而言，有很多设置，都可以控制这个过程：
+两种node：master node，data node；master node的一个很重要的功能，比如说，你现在创建了一个索引，然后这个索引是不是有很多的shard，可能你自己指定了几个primary shard，
+每个primary shard还有一些replica shard。master node，其实就是决定哪些shard分配给哪些node，以及什么时候在node之间移动shard，来让集群达到rebalance。
+对于shard allocation而言，有很多设置，都可以控制这个过程：
 
-（1）cluster level shard allocation，可以在集群层面来控制shard allocation和rebalance的过程
-（2）disk-based shard allocation，es会在shard分配的时候，考虑可用的磁盘空间
-（3）shard allocation awareness，控制shard如何在不同的机架上进行分布
-（4）shard allocation filter，可以控制有些node不参与allocation的过程，这样的话，这些node就可以被安全的下线
+* （1）cluster level shard allocation，可以在集群层面来控制shard allocation和rebalance的过程
+* （2）disk-based shard allocation，es会在shard分配的时候，考虑可用的磁盘空间
+* （3）shard allocation awareness，控制shard如何在不同的机架上进行分布
+* （4）shard allocation filter，可以控制有些node不参与allocation的过程，这样的话，这些node就可以被安全的下线
 
-2、cluster level shard allocation
+#### 2、cluster level shard allocation
 
-shard allocation，就是将shard分配给node的一个过程，这个过程可能会在集群启动初始化进行恢复的时候发生，也会发生在replica shard被分配的时候，集群进行rebalance的时候，或者是有新的node加入，有旧的node被下线的时候。
+shard allocation，就是将shard分配给node的一个过程，这个过程可能会在集群启动初始化进行恢复的时候发生，也会发生在replica shard被分配的时候，
+集群进行rebalance的时候，或者是有新的node加入，有旧的node被下线的时候。
 
-（1）shard allocation settings
+* （1）shard allocation settings
 
-cluster.routing.allocation.enable
 
-all，默认，对所有类型的shard都允许分配
-primaries，仅仅允许primary shard被分配
-new_primaries，仅仅对新建索引的primary shard允许分配
-none，不允许任何shard被分配
+    cluster.routing.allocation.enable
+    
+    all，默认，对所有类型的shard都允许分配
+    primaries，仅仅允许primary shard被分配
+    new_primaries，仅仅对新建索引的primary shard允许分配
+    none，不允许任何shard被分配
 
 但是这个配置对node重启时本地primary shard的恢复没有影响，重启node的时候，如果本地有一个未被分配的primary shard，还是会立即恢复这个primary shard。
 
-cluster.routing.allocation.node_concurrent_incoming_recoveries：在一个node上允许同时恢复多少个shard，这里的shard recovery过程，指的就是要将某个shard分配给这个node。这个设置的默认值是2.
+    cluster.routing.allocation.node_concurrent_incoming_recoveries：在一个node上允许同时恢复多少个shard，这里的shard recovery过程，指的就是要将某个shard分配给这个node。这个设置的默认值是2.
+    cluster.routing.allocation.node_concurrent_outgoing_recoveries：一个node上允许同时进行多少个shard recovery outgoing，比如这个node上，有一个primary shard，现在要将replica shard分配给其他的node，那么就是outgoing shard recovery。默认值也是2.
+    cluster.routing.allocation.node_concurrent_recoveries：同时设置上面两个值
+    cluster.routing.allocation.node_initial_primaries_recoveries：如果replica shard recovery通过网络传输来分配，那么一个未被分配的primary shard会在node重启之后使用本地磁盘上的数据，这个过程因为是使用本地的数据，因此会比较快，默认值是4.
+    cluster.routing.allocation.same_shard.host：默认值是false，如果设置为true，那么就不允许将一个primary shard和replica shard分配到同一个物理机上，也许这个物理机上启动了多个es实例。
 
-cluster.routing.allocation.node_concurrent_outgoing_recoveries：一个node上允许同时进行多少个shard recovery outgoing，比如这个node上，有一个primary shard，现在要将replica shard分配给其他的node，那么就是outgoing shard recovery。默认值也是2.
-
-cluster.routing.allocation.node_concurrent_recoveries：同时设置上面两个值
-
-cluster.routing.allocation.node_initial_primaries_recoveries：如果replica shard recovery通过网络传输来分配，那么一个未被分配的primary shard会在node重启之后使用本地磁盘上的数据，这个过程因为是使用本地的数据，因此会比较快，默认值是4.
-
-*****：cluster.routing.allocation.same_shard.host：默认值是false，如果设置为true，那么就不允许将一个primary shard和replica shard分配到同一个物理机上，也许这个物理机上启动了多个es实例。
-
-有可能你有一台超级服务器，32核CPU+128G内存，这个时候的话呢，可能你在这台机器上启动两个es进程，但是默认情况下，有可能一个shard的primary shard被分配到了这台物理机上的node1，同时这个primary shard的replica shard被分配到了这台物理机上的node2，此时，primary shard和replica shard就在同一台物理机上了。
+有可能你有一台超级服务器，32核CPU+128G内存，这个时候，可能你在这台机器上启动两个es进程，但是默认情况下，有可能一个shard的primary shard被分配到了这台物理机上的node1，
+同时这个primary shard的replica shard被分配到了这台物理机上的node2，此时，primary shard和replica shard就在同一台物理机上了。
 
 可用性是比较低的，因为如果这台物理机挂掉了，比较惨烈了，primary shard和replica shard全部丢失
 
-（2）shard rebalance settings
+* （2）shard rebalance settings
 
-rebalance，什么意思，比如说你的集群，有5台机器，一共有100个shard，负载均衡的情况下，平均分配一下呢，每个机器上有20个shard。然后此时加入了一台新机器，6台机器了，此时就要触发rebalance操作，重新让整个集群负载均衡，100 / 6 = 16~17个shard每台机器
+rebalance，什么意思，比如说你的集群，有5台机器，一共有100个shard，负载均衡的情况下，平均分配一下呢，每个机器上有20个shard。
+然后此时加入了一台新机器，6台机器了，此时就要触发rebalance操作，重新让整个集群负载均衡，100 / 6 = 16~17个shard每台机器
 
-如果下线一台机器的话。。。
+如果下线一台机器
 
 cluster.routing.rebalance.enable
 
-all，默认，允许对所有类型的shard进行rebalance过程
-primaries，仅仅允许对primary shard进行rebalance过程
-replicas，仅仅允许对replica shard进行rebalance
-none，不允许对任何shard进行rebalance
+    all，默认，允许对所有类型的shard进行rebalance过程
+    primaries，仅仅允许对primary shard进行rebalance过程
+    replicas，仅仅允许对replica shard进行rebalance
+    none，不允许对任何shard进行rebalance
 
 cluster.routing.allocation.allow_rebalance
 
-always，任何时候都允许rebalance
-indices_primaries_active，仅仅只有在所有的primary shard都被分配之后才允许rebalance
-indices_all_active，默认，仅仅允许所有的primary shard和replica shard都被分配之后，才能rebalance
+    always，任何时候都允许rebalance
+    indices_primaries_active，仅仅只有在所有的primary shard都被分配之后才允许rebalance
+    indices_all_active，默认，仅仅允许所有的primary shard和replica shard都被分配之后，才能rebalance
 
 cluster.routing.allocation.cluster_concurrent_rebalance
 
-允许控制多少个shard rebalance的操作同时运行，默认是2
+    允许控制多少个shard rebalance的操作同时运行，默认是2
 
-（3）shard balance heuristics
+* （3）shard balance heuristics
 
-cluster.routing.allocation.balance.shard：设置每个node的shard分配的权重因子，默认是0.45f，提高权重因子，就会尽可能让均匀的shard分配给集群中的所有node
 
-cluster.routing.allocation.balance.index：定义每个index在一个node上的shard数量因子，默认是0.55f，提高这个参数，就会尽可能让每个index的shard均匀分配到所有的node上
+    cluster.routing.allocation.balance.shard：设置每个node的shard分配的权重因子，默认是0.45f，提高权重因子，就会尽可能让均匀的shard分配给集群中的所有node
+    cluster.routing.allocation.balance.index：定义每个index在一个node上的shard数量因子，默认是0.55f，提高这个参数，就会尽可能让每个index的shard均匀分配到所有的node上
+    cluster.routing.allocation.balance.threshold：默认是1.0f，提高这个权重因子会导致集群对shard balance有更小的侵略性
 
-cluster.routing.allocation.balance.threshold：默认是1.0f，提高这个权重因子会导致集群对shard balance有更小的侵略性
-
-3、disk-based shard allocation
+#### 3、disk-based shard allocation
 
 es在进行shard allocation的时候，会充分考虑每一个node的可用磁盘空间
 
-cluster.routing.allocation.disk.threshold_enabled：默认是true，如果是false会禁用基于disk的考虑
+    cluster.routing.allocation.disk.threshold_enabled：默认是true，如果是false会禁用基于disk的考虑
 
-cluster.routing.allocation.disk.watermark.low：控制磁盘使用率的低水位，默认是85%，如果一个节点的磁盘空间使用率已经超过了85%，那么就不会分配shard给这个node了
+    cluster.routing.allocation.disk.watermark.low：控制磁盘使用率的低水位，默认是85%，如果一个节点的磁盘空间使用率已经超过了85%，那么就不会分配shard给这个node了
 
-cluster.routing.allocation.disk.watermark.high：控制磁盘使用率的高水位，默认是90%，如果一个节点的磁盘空间使用率已经超过90%了，那么就会将这个node上的部分shard移动走
+    cluster.routing.allocation.disk.watermark.high：控制磁盘使用率的高水位，默认是90%，如果一个节点的磁盘空间使用率已经超过90%了，那么就会将这个node上的部分shard移动走
 
-cluster.info.update.interval：es检查集群中每个node的磁盘使用率的时间间隔，默认是30s
+    cluster.info.update.interval：es检查集群中每个node的磁盘使用率的时间间隔，默认是30s
 
-cluster.routing.allocation.disk.include_relocations：默认是true，意味着es在计算一个node的磁盘使用率的时候，会考虑正在分配给这个node的shard。
+    cluster.routing.allocation.disk.include_relocations：默认是true，意味着es在计算一个node的磁盘使用率的时候，会考虑正在分配给这个node的shard。
 
-4、shard allocation awareness
+#### 4、shard allocation awareness
 
-（1）机架感知特性
+* （1）机架感知特性
 
-如果在一个物理机上运行多个虚拟机，并且在多个虚拟机中运行了多个es节点，或者在多个机架上，多个机房，都有可能有多个es节点在相同的物理机上，或者在相同的机架上，或者在相同的机房里，那么这些节点就可能会因为物理机，机架，机房的问题，一起崩溃
+如果在一个物理机上运行多个虚拟机，并且在多个虚拟机中运行了多个es节点，或者在多个机架上，多个机房，都有可能有多个es节点在相同的物理机上，或者在相同的机架上，或者在相同的机房里，
+那么这些节点就可能会因为物理机，机架，机房的问题，一起崩溃
 
 如果es可以感知到硬件的物理布局，就可以确保说，priamry shard和replica shard一定是分配到不同的物理机，或者物理机架，或者不同的机房，这样可以最小化物理机，机架，机房崩溃的风险
 
 shard allocation awareness可以告诉es我们的硬件架构
 
-举哥例子，如果我们有多个机架，那么我们启动一个node的时候，就要告诉这个node它在哪个机架上，可以给它一个rack_id，比如下面的命令：./bin/elasticsearch -Enode.attr.rack_id=rack_one，也可以在elasticsearch.yml中设置这个机架id
+举个例子，如果有多个机架，那么我们启动一个node的时候，就要告诉这个node它在哪个机架上，可以给它一个rack_id，比如下面的命令：./bin/elasticsearch -Enode.attr.rack_id=rack_one，
+也可以在elasticsearch.yml中设置这个机架id
 
-cluster.routing.allocation.awareness.attributes: rack_id
-node.attr.rack_id=rack_one
+    cluster.routing.allocation.awareness.attributes: rack_id
+    node.attr.rack_id=rack_one
 
-上面的两行设置里，第一行是设置机架id的属性名称，第二行是用那个机架id属性名称设置具体的机架id
+上面的两行设置里，第一行是设置机架id的属性名称，第二行是用那个机架id属性名称设置具体的机架id。
+如果启动两个node，都在一个机架上，此时创建一个有5个primary shard和5个replica shard的索引，此时shards会被分配到两个节点上。
+如果再启动两个node，设置为另外一个机架，此时es会将shard移动到新的node上，去确保说，不会让primary shard和其replica shard在同一个机架上。
+但是如果机架2故障了，为了恢复集群，那么还是会在恢复的时候，将shards全部在机架1上分配的
 
-如果启动两个node，都在一个机架上，此时创建一个有5个primary shard和5个replica shard的索引，此时shards会被分配到两个节点上
-
-如果再启动两个node，设置为另外一个机架，此时es会将shard移动到新的node上，去确保说，不会让primary shard和其replica shard在同一个机架上。但是如果机架2故障了，为了恢复集群，那么还是会在恢复的时候，将shards全部在机架1上分配的
-
-prefer local shard机制：在执行search或者get请求的时候，如果启用了shard awareness特性，那么es会尽量使用local shard来执行请求，也就是在同一个awareness group中的shard来执行请求，也就是说尽量用一个机架或者一个机房中的shard来执行请求，而不要跨机架或者跨机房来执行请求
-
+prefer local shard机制：在执行search或者get请求的时候，如果启用了shard awareness特性，那么es会尽量使用local shard来执行请求，也就是在同一个awareness group中的shard来执行请求，
+也就是说尽量用一个机架或者一个机房中的shard来执行请求，而不要跨机架或者跨机房来执行请求。
 可以指定多个awareness属性，比如机架id和机房名称，类似下面：cluster.routing.allocation.awareness.attributes: rack_id,zone
 
-（2）强制性的感知
+* （2）强制性的感知
 
-如果现在我们有两个机房，并且有足够的硬件资源来容纳所有的shard，但是可能每个机房的硬件只能容纳一半shard，不能容纳所有的shard。如果仅仅使用原始的感知特性，如果一个机房故障了，那么es会将需要恢复的shard全部分配给剩下的一个机房，但是剩下的那个机房的硬件资源并不足以容纳所有的shard。
+如果现在我们有两个机房，并且有足够的硬件资源来容纳所有的shard，但是可能每个机房的硬件只能容纳一半shard，不能容纳所有的shard。如果仅仅使用原始的感知特性，如果一个机房故障了，
+那么es会将需要恢复的shard全部分配给剩下的一个机房，但是剩下的那个机房的硬件资源并不足以容纳所有的shard。
 
-强制感知特性会解决这个问题，因为这个特性会绝对不允许在一个机房内分配所有的shard
+强制感知特性会解决这个问题，因为这个特性会绝对不允许在一个机房内分配所有的shard。
+比如: 有一个感知属性叫做zone，有两个机房，zone1和zone2，看看下面的配置：
 
-比如说，有一个感知属性叫做zone，有两个机房，zone1和zone2，看看下面的配置：
+    cluster.routing.allocation.awareness.attributes: zone
+    cluster.routing.allocation.awareness.force.zone.values: zone1,zone2 
 
-cluster.routing.allocation.awareness.attributes: zone
-cluster.routing.allocation.awareness.force.zone.values: zone1,zone2 
+那么此时如果将2个node分配给zone1机房，然后创建一个索引，5个primary shard和5个replica shard，但是此时只会在zone1机房分配5个primary shard，
+只有我们启动一批node在zone2机房，才会分配replica shard
 
-那么此时如果将2个node分配给zone1机房，然后创建一个索引，5个primary shard和5个replica shard，但是此时只会在zone1机房分配5个primary shard，只有我们启动一批node在zone2机房，才会分配replica shard
+#### 5、shard allocation filtering
 
-5、shard allocation filtering
-
-shard allocation filtering可以让我们允许或者不允许某些index的shard分配给一些特殊的节点，典型的用途，就是如果我们要下线一些node，就可以用这个feature禁止shard分配给这些即将下线的node，而且我们还可以将这些即将下线的节点的shard移动到其他节点。
+shard allocation filtering可以让我们允许或者不允许某些index的shard分配给一些特殊的节点，典型的用途，就是如果我们要下线一些node，
+就可以用这个feature禁止shard分配给这些即将下线的node，而且我们还可以将这些即将下线的节点的shard移动到其他节点。
 
 用下面的命令可以下线一个节点，因为就不允许将shard分配给这个节点了
 
-PUT _cluster/settings
-{
-  "transient" : {
-    "cluster.routing.allocation.exclude._ip" : "10.0.0.1"
-  }
-}
+    PUT _cluster/settings
+    {
+      "transient" : {
+        "cluster.routing.allocation.exclude._ip" : "10.0.0.1"
+      }
+    }
 
-6、node下线时的shard延迟分配
+#### 6、node下线时的shard延迟分配
 
 如果从集群中下线一个节点，master会做下面这些事情：
 
-（1）如果那个节点上有primary shard，那么master会将那些primary shard在其他节点上的replica shard提升为primary shard
-（2）分配新的replica shard来保证replica数量充足
-（3）在剩下的各个node上进行shard rebalance，确保负载均衡
+* （1）如果那个节点上有primary shard，那么master会将那些primary shard在其他节点上的replica shard提升为primary shard
+* （2）分配新的replica shard来保证replica数量充足
+* （3）在剩下的各个node上进行shard rebalance，确保负载均衡
 
 这些操作可以保护集群不会丢失数据，因为会对每个shard都复制充足的replica shard
 
-但是这个过程，可能会导致集群中出现很重的负载，包括网络负载和磁盘IO负载，如果那个下线的节点只是因为故障被下线，马上就会有新的节点来顶替它，那么这种立即执行的shard recovery过程是不需要的，考虑下面的场景：
+但是这个过程，可能会导致集群中出现很重的负载，包括网络负载和磁盘IO负载，如果那个下线的节点只是因为故障被下线，马上就会有新的节点来顶替它，
+那么这种立即执行的shard recovery过程是不需要的，考虑下面的场景：
 
-（1）某个node跟集群丢失了网络连接
-（2）master node将那个node上的primary shard对应的其他节点上的replica shard提升为primary shard
-（3）master node分配新的replica shard到其他节点上
-（4）每个新的replica shard都会通过网络传输一份primary shard的完整的副本数据
-（5）很多shard都被移动到其他的node来让集群rebalance
-（6）但是几分钟以后，那个丢失了网络连接的node又重新连接到了集群中
-（7）master节点又要再次进行rebalance操作，因为需要将一些shard分配给那个node
+* （1）某个node跟集群丢失了网络连接
+* （2）master node将那个node上的primary shard对应的其他节点上的replica shard提升为primary shard
+* （3）master node分配新的replica shard到其他节点上
+* （4）每个新的replica shard都会通过网络传输一份primary shard的完整的副本数据
+* （5）很多shard都被移动到其他的node来让集群rebalance
+* （6）但是几分钟以后，那个丢失了网络连接的node又重新连接到了集群中
+* （7）master节点又要再次进行rebalance操作，因为需要将一些shard分配给那个node
 
 其实如果master node也许只要等待几分钟，那么丢失的那个node自己会回来，丢失的shard也会自动恢复过来，因为数据都在节点的本地，不需要重新拷贝数据以及网络传输，这个过程是非常快速的
 
 index.unassigned.node_left.delayed_timeout，这个参数可以设置某个节点下线之后，对应的replica shard被重新复制和分配的时间等待期，默认是1m，可以通过下面的命令来修改：
 
-PUT _all/_settings
-{
-  "settings": {
-    "index.unassigned.node_left.delayed_timeout": "5m"
-  }
-}
+    PUT _all/_settings
+    {
+      "settings": {
+        "index.unassigned.node_left.delayed_timeout": "5m"
+      }
+    }
 
 如果启用了delayed allocation之后，那么就会看到下面的场景：
 
-（1）某个node丢失了网络连接
-（2）master将那个node上的一些primary shard对应的其他node上的replica shard提升为primary shard
-（3）master记录下来一条消息日志，这个primary shard的replica shard还没有重新分配和开始，被delayed了，会等待1m
-（4）cluster会保持yellow状态，因为没有足够的replica shard
-（5）那个丢失了的node在几分钟之后，如果回到了集群中
-（6）缺失的那些replica shard会直接分配给那个node，使用其本地的数据即可
+* （1）某个node丢失了网络连接
+* （2）master将那个node上的一些primary shard对应的其他node上的replica shard提升为primary shard
+* （3）master记录下来一条消息日志，这个primary shard的replica shard还没有重新分配和开始，被delayed了，会等待1m
+* （4）cluster会保持yellow状态，因为没有足够的replica shard
+* （5）那个丢失了的node在几分钟之后，如果回到了集群中
+* （6）缺失的那些replica shard会直接分配给那个node，使用其本地的数据即可
 
 如果某个node确定了肯定不会再回到集群中，那么可以通过下面的命令，手动设置一下，直接不等待那个节点回来了
 
-PUT _all/_settings
-{
-  "settings": {
-    "index.unassigned.node_left.delayed_timeout": "0"
-  }
-}
+    PUT _all/_settings
+    {
+      "settings": {
+        "index.unassigned.node_left.delayed_timeout": "0"
+      }
+    }
 
-7、索引恢复的优先级
+#### 7、索引恢复的优先级
 
 没有被分配的shard都是按照优先级来分配的，有下面几个优先级，index.priority，索引的创建日期，索引名称
 
-PUT index_3
-{
-  "settings": {
-    "index.priority": 10
-  }
-}
+    PUT index_3
+    {
+      "settings": {
+        "index.priority": 10
+      }
+    }
 
-8、每个节点的shard数量
+#### 8、每个节点的shard数量
 
 cluster.routing.allocation.total_shards_per_node，设置每个节点最多承载的shard数量，默认是无限制的
 
+### 18.2 解析gateway
 
+##### gateway，elasticsearch底层的一个module，这个module，也可以认为是什么呢？
 
+认为是es代码中的一个模块。
 
+##### gateway这个模块是负责干什么的？
 
+module，java，j2ee，java web，用户管理模块...，就是类似一个module，是用来管理用户信息的
 
- 
+elasticsearch底层模块，英文，module，类似用户管理模块，订单管理模块，gateway module，是用来进行es自身的一些元数据，
+比如cluster state，里面包含了一些集群中有哪些node，每个node的信息，负载，资源，索引，每个索引的shard在各个node上分配的一些信息...
 
+gateway module，是负责用来存储每个es节点的cluster state的，node重启的时候，gateway也会负责将本地磁盘上的cluster state给它读取出来，放入内存中
 
-     
+local gateway module，用来存储cluster state，并且在集群重启的时候共享数据
+
+以下的设置，必须在每个master候选节点上都进行设置
+
+    gateway.expected_nodes：要求必须有多少个节点在集群中，当加入集群中的节点数量达到这个期望数值之后，每个node的local shard的恢复就会理解开始，默认的值是0，也就是不会做任何的等待
+
+    gateway.expected_master_nodes：要求必须有多少个master node在集群中，只要有这个数量的master node加入了集群，每个node的local shard recovery就会立即开始，默认的值是0
+
+    gateway.expected_data_nodes：要求必须有多少个data node在集群中，只要有这个数量的master node加入了集群，每个node的local shard recovery就会立即开始，默认的值是0
+
+    gateway.recover_after_time：如果期望的节点数量没有达标，那么会等待一定的时间，然后就开始进行shard recovery，默认是等待5m
+
+如果gateway.recover_after_time时间范围内，指定数量的节点还没有加入集群，但是只要满足下面的条件之一就会立即开始恢复
+
+    gateway.recover_after_nodes：只要指定数量的节点加入集群，就开始进行恢复
+
+    gateway.recover_after_master_nodes：只要指定数量的master节点加入集群，就开始进行恢复
+
+    gateway.recover_after_data_nodes：只要指定数量的data node加入集群，就开始恢复
+
+比如集群中一共有10个node
+
+    gateway.recover_after_nodes: 8
+    gateway.expected_nodess: 10
+    gateway.recover_after_time: 10m
+
+要求集群中达到8个节点，接下来，如果等待超过10分钟，就会开始shard recovery，或者是到了8个节点之后，在10分钟之内，立即到了10个节点，那么也会立即开始shard recovery
+
+### 18.3 解析之http、network和transport
+
+#### 1、http module
+
+HTTP module就是es的http api模块；
+http机制是完全异步的，也就是线程不会因为等待响应而陷入阻塞，http异步通信机制的优点就是解决了C10k问题。
+如果可能的话，尽量使用http keep alive，可以提升性能，而且可以避免客户端发生http chunking现象
+
+下面是一些常用的http设置：
+
+    http module，主要是用来对外提供请求接口服务的，我们不是会向es发送一个rest请求，其实就是走es的http module的，其实就是用来处理外部的请求的
+    
+    http.port，es对外暴露的http api接口的端口号，默认在9200~9300之间选择一个，优先选择9200，如果被绑定，则选择9201，以此类推
+
+默认的话，http.port就是9200，如果9200被占用，那么就会用9201，以此类推，一直到9300
+
+#### 2、network module
+
+es默认是绑定到localhost的，这只能让es运行在开发模式下，如果要运行在生产模式下，下面的一些network设置是必须设置的
+
+    network.host：节点绑定的hostname或者ip地址，设置之后，才能进入生产模式下
+
+主要是对一些网络上的基础性的东西进行一个配置；network.host，绑定的是本地的回环地址，127.0.0.1，进入的是development mode，开发模式。
+如果将network.host，设置为比如192.168.31.187之类的这种hostname或者ip地址之后，进入production mode，生产模式
+
+#### 3、transport module
+
+transport是用来进行节点间的互相通信的模块
+
+    transport.tcp.port：用于配置节点间互相通信的端口号，默认是9300，范围在9300~9400之间，优先绑定9300，如果被占用，则用9301，以此类推
+
+    transport module，es各个node之间，其实也会进行频繁的通信，比如交换cluster state，reqeust transfer，比如插入一条document，路由之后，
+    应该是到node3的shard2上去处理，但是请求可能发送到的是node1的shard0上，node1就要将这个document index的请求转发给node3，让node3上的shard2去处理这个请求
+
+默认transport.tcp.port端口号是9300，如果被占用，那么就会用9301，一直到9400，以此类推
+
+### 18.4 解析之threadpool
+
+每个es节点内部多有很多个thread pool，不同的thread pool会处理不同的请求，thread pool module就是用来对各种各样的thread pool进行管理的。
+
+每种thread pool都是绑定了一个queue的，因为thread pool的大小是有限的，比如一个thread pool内部就是10个线程，那么此时如果10个线程都被耗尽了，在执行某项任务，
+此时新的请求要这个thread pool中的线程来处理，会怎么样？默认情况下，肯定就惨了，因为没有线程处理了，可能就会报错了。
+
+但是es的thread pool都是绑定了一个内存中的队列的，queue，如果thread pool满了之后，请求可以进这个queue里面来排队，等待线程池出现空的线程来处理queue中的请求，这样的话，就提供了一个buffer；
+不至于说，在业务高峰期，大量的报错，因为线程池可能满了，至少用queue缓冲一下，也许请求会因为在queue中等待，执行的慢了一些，但是至少是不会报错，可以执行的。
+
+#### 1、线程池
+
+每个节点都有多个thread pool，这样可以提升多线程处理的能力，这些线程池大多数都有一个对应的queue与其绑定，可以允许线程池满的时候，让pending的请求在队列里排队，而不是将pending请求抛弃掉
+
+    generic thread pool：应付一些普通的操作，比如后台的node discovery，thread pool类型是scaling
+
+    index thread pool：用于进行index和delete操作，是fixed类型，大小为cpu core数量，queue大小是200，这个线程池的最大大小是cpu core数量 + 1
+
+    search thread pool：用于search操作，是fixed类型，大小是cpu core数量 * 3 / 2 + 1，queue大小是1000
+
+    get thread pool：用于get操作，是fixed类型，大小是cpu core数量，队列大小是1000
+
+    bulk thread pool：用于bulk操作，是fixed类型，大小是cpu core数量，queue大小是200，最大的线程池大小是cpu core数量 + 1
+
+    snapshot thread pool：用于snapshot/restore操作，是scaling类型，每个线程存活时间为5m，最大数量是min(5, cpu core数量 / 2)
+
+    refresh thread pool：用于refresh操作，是scaling类型，存活时间为5m，最大数量是min(10, cpu core数量 / 2)
+
+用下面的方式来修改thread pool；在elasticsearch.yml配置文件中，按照下面的格式来进行配置
+
+    thread_pool:
+        bulk:
+            size: 16
+            queue_size: 1000
+
+#### 2、线程池类型
+
+fixed类型线程池：线程数量是固定的，同时绑定一个queue用于存放pending request
+
+scaling类型：这种线程池数量是可变的，根据负载来变化，最小是cpu core数量，最大是其公式定义，keep_alive参数可以控制其线程空闲多长时间被释放
+
+    thread_pool:
+        refresh:
+            core: 1
+            max: 8
+            keep_alive: 2m
+
+#### 3、cpu core数量设置
+
+在elasticsearch.yml配置文件中去设置的
+
+    processors: 2
+
+通过上面的参数可以显示设置cpu core数量，意义有下面3点：
+
+* （1）如果在一台机器上运行了多个es节点，但是可能只想要让每个es节点使用部分cpu core，而不是物理机上的所有cpu core，就可以手动设置。
+比如一台物理机，上面的cpu core是16个，运行了两个es节点，此时就可以手动设置processors是8，就是让每个es节点仅仅使用8个cpu core。
+* （2）默认cpu core的数量最大限制为32个，所以如果我们如果物理机超过了32个cpu core，那么可以手动设置。比如说你的物理机的cpu core是64个，
+但是此时es会去使用的cpu core可能也就32个，最大限制，此时就是要手动设置processors是64。
+* （3）有时候可能会捕获到错误的cpu core数量，此时需要手动设置。
+
+### 18.5 深入解析之plugin
+
+plugin module，主要就是用来负责这个插件的管理，安装插件，查看插件，删除插件，更新插件
+
+安装plugin：elasticsearch-plugin install [plugin_name]
+
+通过url安装plugin：elasticsearch-plugin install [url]
+
+如果你的机器可能是不能直接连外网的，那么你可能需要将plugin插件下载下来一个包，在本地离线安装这个插件，其实在实际的运维中，这个比较常见
+
+通过本地包离线安装plugin：elasticsearch-plugin install file:///path/to/plugin.zip
+
+查看plugin list：elasticsearch-plugin list
+
+删除plugin：elasticsearch-plugin remove [pluginname]，如果删除了一个plugin，必须重启节点才能生效
+
+升级/更新plugin：先删除，再安装，然后重启节点
+
+比如说，你现在升级了es节点的版本，然后就得对应着升级你的plugin，自动装的就是最新版的了，当然装好以后，要重启es node才能生效
+
+### 18.6 深入解析之node
+
+node module，主要是用来处理各种不同类型的节点的，es有哪些类型的node，另外就是对这些类型的node有些什么特殊的参数，对于一个较大的集群来说，如何去规划和配置各种各样的node
+
+#### 1、node类型
+
+如果我们启动es的一个实例，那么就是启动了一个es node，一些es node就可以组成一个es集群。如果仅仅运行了一个es node，那么也有一个es集群，只是节点数量就是1。
+集群中的每个node都可以处理http和transport请求，其中transport层是用来处理节点间的通信的，http层是用来处理外部的客户端rest请求的。
+所有的node都知道集群中的其他node，并且可以将客户端的请求转发到适当的节点上去。
+
+节点的类型包含以下几种：
+
+* （1）master-eligible node：master候选节点，将node.master设置为true（默认），代表这个node就是master的候选节点，可以被选举为master node，然后控制整个集群。
+* （2）data node：将node.data设置为true（默认），data node可以存储数据，同时处理这些数据相关的操作，比如CRUD操作，搜索操作，聚合操作，等等。
+* （3）ingest node：将node.ingest设置为true（默认），ingest node是用来对document写入索引文件之前进行预处理的。
+可以对每个document都执行一条ingest pipeline，在document写入索引文件之前，先对其数据进行处理和转化。
+但是如果要执行的ingest操作太过繁重，那么可以规划单独的一批ingest node出来，然后将node.master和node.data都设置为false即可。
+* （4）tribe node：tribe node可以通过tribe.*相关参数来设置，它是一种特殊的coordinate node，可以连接到多个es集群上去，然后对多个集群执行搜索等操作。
+* （5）默认情况下，每个node的node.master，node.data，node.ingest都是true，都是master候选节点，也可以作为data node存储和操作数据，同时也可以作为ingest node对数据进行预处理。
+对于小于20个节点的小集群来说，这种架构是ok的，没问题的。但是如果对于大于20个物理机的集群来说，最好是单独规划出master node、data node和ingest node来。 
+* （6）coordinate node
+
+搜索和bulk等请求可能会涉及到多个节点上的不同shard里的数据，比如一个search请求，就需要两个阶段执行，首先第一个阶段就是一个coordinating node接收到这个客户端的search request。
+接着coordinating node会将这个请求转发给存储相关数据的node，每个data node都会在自己本地执行这个请求操作，同时返回结果给coordinating node，
+接着coordinating node会将返回过来的所有的请求结果进行缩减和合并，合并为一个global结果。
+
+每个node都是一个coordinating node。这就意味着如果一个node，将node.master，node.data，node.ingest全部设置为false，那么它就是一个纯粹的coordinating node，
+仅仅用于接收客户端的请求，同时进行请求的转发和合并。
+
+如果真的是大集群的话，最好也是单独规划一批node出来，就作为coordinating node，然后让es client全部往这些node上去发送请求。
+
+如果真的是一个大于20个节点的生产集群的话，建议将4种node，master node，data node，ingest node，cooridating node，全部分离开来
+
+集群中有30台机器
+
+master node：3个
+
+ingest node：视具体情况而定，具体是看你的ingest预处理操作有多么的复杂，耗费多少资源，但是一般情况下来说，es ingest node用的比较少的，ingest node也可以不用单独规划一批出来
+
+coordinate node：视具体情况而定，但是对大集群来说，最好是单独拆几个节点出来，用于接收客户端的请求，3个节点。主要是看并发访问量有多大，
+比如最大的QPS也就是10，或者是100，那么3个节点肯定够了。如果你的QPS是1000，或者是10000，那么可能就要规划，10个coordinate node，或者100个
+
+data node：24个data node，data node肯定是分配的是最多的，主要用来存储数据，执行各种对数据的操作么，资源耗费肯定是最多的
+
+#### 2、master eligible node
+
+* （1）master-eligible node的介绍以及配置
+
+master node负责轻量级的集群管理工作，比如创建和删除索引，追踪集群中的每个node，决定如何将shards分配给各个node。对于集群来说，有一个稳定的master node，是非常关键的。
+然后master-eligible node都有机会被选举为一个master node，同时master node必须有权限访问path.data指定的data目录，因为master node需要在data目录中存储cluster state。
+
+对数据进行index和search操作，会耗费大量的cpu，内存，磁盘io，以及网络io，耗费的是每个node的资源。因此我们必须要确保master node是非常稳定的，而且是压力不大的，对于大集群来说，
+比较好的办法是划分出单独的master node和data node。如果不拆开的话，一个node又要是data node，要复杂存储数据，处理各种操作，同时又要负责管理集群，可能就会不稳定，出问题。
+
+同时因为默认情况下，master node也能扮演coordinating node的角色，并且将search和index请求路由到对应的data node上去执行，最好是不要让master node来执行这些coordinate操作。
+因为master node的稳定运行对于整个集群来说非常重要，比你利用master node资源来执行一些coordinate操作要重要的多。
+
+如果要设置一个node为专门的master-eligible node，需要做如下的设置：
+
+    node.master: true 
+    node.data: false 
+    node.ingest: false
+
+* （2）通过minimum_master_nodes来避免脑裂问题
+
+要预防数据的丢失，我们就必须设置discovery.zen.minimum_master_nodes参数为一个合理的值，这样的话，每个master-eligible node才知道至少需要多少个master-eligible node才能组成一个集群。
+
+比如现在有一个集群，其中包含两个master-eligible nodes。然后一个网络故障发生了，这两个节点之间丢失了联络。每个节点都认为当前只有一个master-eligible node，就是它们自己。
+此时如果discovery.zen.minimum_master_nodes参数的默认值是1，那么每个node就可以让自己组成一个集群，选举自己为master node即可。结果就会导致出现了两个es集群，这就是脑裂现象。
+即使网络故障解决了，但是这两个master node是不可能重新组成一个集群了。除非某个master eligible node重启，然后自动加入另外一个集群，但是此时写入这个节点的数据就会彻底丢失。
+
+那么如果现在我们有3个master-eligible node，同时将discovery.zen.minimum_master_nodes设置为2.如果网络故障发生了，此时一个网络分区有1个node，另外一个网络分区有2个node，
+只有一个node的那个网络分区，没法检测到足够数量的master-eligible node，那么此时它就不能选举一个master node出来组成一个新集群。但是有两个node的那个网络分区，
+它们会发现这里有足够数量的master-eligible node，那么就选举出一个新的master，然后组成一个集群。当网络故障解除之后，那个落单的node就会重新加入集群中。
+
+discovery.zen.minimum_master_nodes，必须设置为master-eligible nodes的quorum，quorum的公式为：(master_eligible_nodes / 2) + 1。
+
+换句话来说，如果有3个master-eligible nodes，那么那个参数就必须设置为(3 / 2) + 1 = 2，比如下面这样：
+
+    discovery.zen.minimum_master_nodes: 2
+
+随着集群节点的上线和下限，这个参数都是要重新设置的，可以通过api来设置
+
+    PUT _cluster/settings
+    {
+      "transient": {
+        "discovery.zen.minimum_master_nodes": 2
+      }
+    }
+
+此时将master node和data node分离的好处就出来了，一般如果单独规划一个master nodes的话，只要规划固定的3个node是master-eligible node就可以了，
+那么data node无论上线和下限多少个，都无所谓的。
+
+#### 3、data node
+
+data node负责存储shard的数据，也就是那些document。data node可以处理各种操作，比如CRUD，搜索，聚合。这些操作全都是很耗费IO，内存和cpu资源的。因此监控这些资源的使用是很重要的，
+同时如果资源过载了，那么就要添加更多的data node。
+
+如果要设置一个专门的data node，需要做出如下的设置：
+
+    node.master: false 
+    node.data: true 
+    node.ingest: false
+
+#### 4、ingest node
+
+nigest node可以执行预处理pipeline，包含了多个ingest processors。不同的ingest processor执行的操作类型是不同的，那么对资源的需求也是不同的，
+不过还是最好是规划一批单独的ingest node出来，不要跟master node和data node混合在一起。
+
+如果要配置一个单独的ingest node：
+
+    node.master: false 
+    node.data: false 
+    node.ingest: true 
+    search.remote.connect: false
+
+#### 5、coordinating only node
+
+如果我们规划了一批专门的master node，data node以及ingest node，那么此时还遗留下来了一种node，那就是coordinating node，
+这些node专门用来接收客户端的请求，同时对请求进行路由和转发，并对请求的结果进行合并。
+
+coordinating only nodes对于大集群来说，可以使用专门的node来负载coordinate操作，而不是让coordinate操作的工作负载集中到master node和data node上去。
+coordinating node也会加入cluster，同时可以获取到完整的cluster state，它们主要是用cluster state中包含的node info来进行请求转发。
+
+如果在一个集群中规划太多的coordinating node可能会加重整个集群的负担，因为被选举出来的master node必须要从所有的node上得到cluster state update的ack，
+如果coordinating nodes过多，那么可能会加重master node的负担。
+
+如果要设置coordinating only node的话：
+
+    node.master: false 
+    node.data: false 
+    node.ingest: false 
+    search.remote.connect: false
+
+#### 6、node data path设置
+
+* （1）path.data
+
+每个data和master-eligible node都需要能够访问data目录，在那里存储了每个shard的数据，包括cluster state也存储在那里。path.data默认是指向$ES_HOME/data目录的，
+但是在生产环境中，肯定是不能这样设置的，因为在升级es的时候，可能会导致数据被清空或者覆盖。
+
+此时一般需要在elasticsearch.yml中设置path.data：
+
+    path.data:  /var/elasticsearch/data
+
+* （2）node.max_local_storage_nodes
+
+data目录可以被多个node共享，即使是不同集群中的es node，也许他们在一个物理机上启动了。这个共享的方式对于我们测试failover是很有用的，以及在开发机上测试不同的配置。
+但是在生产环境下，绝对不用这么做，一个data目录就给一个es node使用即可。默认情况下，es被配置成阻止超过一个node共享data目录中的数据，如果要允许多个node共享一个data目录，
+需要设置node.max_local_storage_nodes为一个超过1的数字。
